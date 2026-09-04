@@ -39,7 +39,8 @@ video benchmark <input>    measure fastest encoder/concurrency on this machine
 ```
 video detect-silence <input>       silence gaps: {segments: [{start, end, duration}]}
 video detect-scenes <input>        scene-cut boundaries: {boundaries: [{timestamp, confidence}]}
-video transcribe <input>           timestamped transcript (Parakeet via Handy; windowed)
+video transcribe <input>           timestamped transcript (Parakeet via Handy; windowed;
+                                   --engine/--model/--chunk, --concurrency N parallel windows)
 video detect-filler <t.json>       filler-word candidates from a transcript
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
 video captions <t.json>            transcript → .srt; --plan remaps cue times through cuts
@@ -55,7 +56,7 @@ video generate-proxy <input>       low-cost review copy (default 480w, CRF 28)
 
 Results are cached per (source fingerprint, parameters) under `.video-agent/cache/` — an unchanged source costs nothing on re-analysis. Workers never modify the source and never render edits; they only observe. A video without audio yields an empty silence/transcript report with a `note`, not an error.
 
-**Transcription engines**: the engine boundary (`src/analysis/transcribe/engines.ts`) takes any backend that turns a 16 kHz mono WAV into text. Implemented: **handy** (`/Applications/Handy.app`, Parakeet TDT 0.6B v3 on Metal, 5–21× realtime measured). Handy emits whole-file text without timestamps, so the worker windows the audio (default 25 s chunks, boundaries snapped to nearby silence) — segment times are exact by construction, text granularity is the window. Swap in whisper.cpp/sherpa by implementing one interface.
+**Transcription engines**: the engine boundary (`src/analysis/transcribe/engines.ts`) takes any backend that turns a 16 kHz mono WAV into text. Implemented: **handy** (`/Applications/Handy.app`, Parakeet TDT 0.6B v3 on Metal, 5–21× realtime measured). Handy emits whole-file text without timestamps, so the worker windows the audio (default 25 s chunks, boundaries snapped to nearby silence) — segment times are exact by construction, text granularity is the window. Windows can run in parallel: `--concurrency N` (default 1, or the cached `video benchmark` recommendation for the source) bounds how many WAV extractions + independent engine processes run at once; output stays byte-identical to sequential because results are reassembled in window order. Swap in whisper.cpp/sherpa by implementing one interface.
 
 The **observation → plan bridges**: `video plan <input> --cuts-from silence.json [--min-duration 0.5] [--pad 0.25]` expands qualifying silence gaps into explicit `cut` operations in the scaffolded plan. `video plan <input> --cuts-from filler.json [--filler-pad-before 0.10] [--filler-pad-end 0.25]` expands filler-word instances into `cut` operations — the report shape (silence vs filler) is discriminated automatically, and the filler pads expand beyond the estimate because filler times are linear estimates within segment granularity. `video plan <input> --highlights-from highlights.json [--count 5] [--min-score 0.35] [--pad 0.5]` scaffolds a highlight **compilation** — the top candidates by score become `trim` operations that replace the whole-source keep (overlapping trims union; a report with no qualifying candidate leaves the whole-source scaffold; one bridge per invocation). The expansions are deterministic; the editorial decisions live in the parameters and in whatever you delete or tune afterwards.
 

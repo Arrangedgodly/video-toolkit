@@ -67,6 +67,23 @@ test("transcribe: real speech -> timestamped segments (parakeet via handy)", { s
   }
 });
 
+test("transcribe: --concurrency 2 byte-identical to sequential; cache key unchanged", { skip: !handyAvailable }, async () => {
+  // 10 s fixture, chunk 3 -> 4 windows: the parallel run genuinely overlaps
+  const par = await transcribeInput(FIXTURE, { chunkSeconds: 3, concurrency: 2 }); // miss -> writes cache
+  const lines: string[] = [];
+  const hit = await transcribeInput(FIXTURE, {
+    chunkSeconds: 3,
+    concurrency: 2,
+    debug: (l) => lines.push(l),
+  });
+  const seq = await transcribeInput(FIXTURE, { chunkSeconds: 3, noCache: true }); // recompute sequentially
+  assert.equal(JSON.stringify(par), JSON.stringify(seq), "parallel report must be byte-identical");
+  assert.ok(
+    lines.some((l) => l.includes("cache hit: transcript-handy")),
+    lines.join("; "),
+  );
+});
+
 test("transcribe: no audio stream -> empty report with note", { skip: !handyAvailable }, async () => {
   const r = await runCapture("ffmpeg", [
     "-nostdin", "-hide_banner", "-loglevel", "error", "-y",

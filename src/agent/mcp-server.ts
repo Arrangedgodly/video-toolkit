@@ -129,7 +129,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "video_transcribe",
     description:
-      "Timestamped transcript (windowed; boundaries snapped to silence). Engine: handy (Parakeet). Cached per source+engine+model+chunk.",
+      "Timestamped transcript (windowed; boundaries snapped to silence; windows run with bounded parallelism via concurrency, default 1 or the cached benchmark recommendation — report byte-identical to sequential). Engine: handy (Parakeet). Cached per source+engine+model+chunk.",
     inputSchema: {
       type: "object",
       properties: {
@@ -138,6 +138,7 @@ const TOOLS: ToolDef[] = [
         model: str,
         chunk_seconds: { type: "number" },
         snap_to_silence: { type: "boolean" },
+        concurrency: { type: "number" },
       },
       required: ["input"],
     },
@@ -276,6 +277,7 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
         model: a.model !== undefined ? String(a.model) : undefined,
         chunkSeconds: a.chunk_seconds as number | undefined,
         snapToSilence: a.snap_to_silence as boolean | undefined,
+        concurrency: a.concurrency as number | undefined,
       });
     case "video_detect_filler": {
       let doc: unknown;

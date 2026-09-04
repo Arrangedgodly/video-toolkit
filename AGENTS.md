@@ -31,7 +31,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | `benchmark` | `<input>` | `--seconds <n=6>` | `{segmentSeconds, recommended:{encoder, renderConcurrency}, results[]}` (measured, not inferred) | benchmark.json |
 | `detect-silence` | `<input>` | `--threshold <dB=35> --min-duration <s=0.5>` | SilenceReport | silence-t<thr>-d<min>.json |
 | `detect-scenes` | `<input>` | `--threshold <0..1=0.4>` | SceneReport | scenes-t<thr>.json |
-| `transcribe` | `<input>` | `--engine handy --model <id> --chunk <s=25> --no-snap` | TranscriptReport | transcript-<engine>-<model>-c<chunk>.json |
+| `transcribe` | `<input>` | `--engine handy --model <id> --chunk <s=25> --no-snap --concurrency <n>` | TranscriptReport — windows run as bounded parallel jobs (n at a time; default = cached `video benchmark` renderConcurrency recommendation for this source+ffmpeg build, clamped ≤4, else 1); report byte-identical to sequential (segments re-sorted by window start; concurrency NOT in the cache key — warm cache hits at any n); non-integer/<1 n → `OPERATION_INVALID`; any window failure fails the whole task (`TRANSCRIPTION_ENGINE_FAILED`) | transcript-<engine>-<model>-c<chunk>.json |
 | `detect-filler` | `<transcript.json>` | `--words "um,uh,…"` | FillerReport | none (pure transform) |
 | `find-highlights` | `<input>` | `--transcript <t.json> --keywords "a,b" --min-score <0.35> --count <5>` | HighlightReport | silence cache reused |
 | `captions` | `<transcript.json>` | `--plan <p.json> -o <out.srt>` | `{output, cues, dropped, remapped}` | none |
@@ -79,6 +79,7 @@ Zod source of truth: `src/core/schemas.ts`. Shapes: SilenceReport `{segments:[{s
 
 - **handy** (implemented; priority 1): binary `/Applications/Handy.app/Contents/MacOS/handy` (or `~/Applications/…`). Headless: `-f <16kHz-mono.wav> --json [--model <id>]`. stdout = single JSON `{text, model, best_ms, audio_secs, rtf,…}`; logs → stderr; **exits in `-f` mode; `--list-models` mode never exits — always wrap with timeout**. Default model on this machine: `parakeet-tdt-0.6b-v3` (Q8_0, Metal; 5–21× realtime measured).
 - **No native segments** ⇒ toolkit windows the audio (chunk default 25 s, boundaries snapped to silence gaps ±chunk/3, exact times by construction). 1 h source ≈ minutes; cached per source+engine+model+chunk.
+- **Parallel windows** (safe + deterministic): `--concurrency <n>` runs per-window WAV extraction + engine invocations as bounded parallel jobs — engine invocations are independent processes (each loads its own model; keep n conservative on 16 GB; tmp WAVs unique per window index). Results are reassembled in window order, so out-of-order completion cannot reorder segments; the lowest-index window failure fails the whole task; report byte-identical to sequential (measured 1.8× wall-time at n=2 vs 4.95 s sequential on a 26 s source, 2026-09-03). Default n = cached `video benchmark` renderConcurrency for the source (≤4), else 1.
 - Add an engine: implement `TranscriptionEngine` (`src/analysis/transcribe/engines.ts`), append to `ENGINES` (priority = agent-efficiency order), parser unit test, update this table.
 
 ## ENVIRONMENT FACTS (this machine; re-run `video diagnose` to confirm)

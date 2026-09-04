@@ -36,6 +36,8 @@ analysis (timestamped observations; never render):
   detect-scenes <input>      scene-cut boundaries [--threshold 0..1]
   transcribe <input>         timestamped transcript [--engine handy] [--model ID]
                              [--chunk s] [--no-snap (silence boundary snapping)]
+                             [--concurrency N (parallel windows; default 1 or
+                             the cached benchmark recommendation)]
   detect-filler <transcript.json>  filler-word candidates [--words "um,uh,..."]
   find-highlights <input>    highlight proposals from --transcript t.json
                              [--keywords "a,b,c"] [--min-score 0.35] [--count 5]
@@ -91,6 +93,7 @@ interface CliFlags {
   engine?: string;
   model?: string;
   chunk?: number;
+  concurrency?: number;
   noSnap?: boolean;
   words?: string;
   transcript?: string;
@@ -135,6 +138,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--engine") f.engine = argv[++i];
     else if (a === "--model") f.model = argv[++i];
     else if (a === "--chunk") f.chunk = Number(argv[++i]);
+    else if (a === "--concurrency") f.concurrency = Number(argv[++i]);
     else if (a === "--no-snap") f.noSnap = true;
     else if (a === "--words") f.words = argv[++i];
     else if (a === "--transcript") f.transcript = argv[++i];
@@ -326,6 +330,7 @@ async function main(): Promise<void> {
           model: f.model,
           chunkSeconds: f.chunk,
           snapToSilence: f.noSnap ? false : undefined,
+          concurrency: f.concurrency,
           noCache: f.noCache,
           debug: debugLine(f),
         }),
