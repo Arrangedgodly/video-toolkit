@@ -96,6 +96,44 @@ test("preview writes <stem>.preview.mp4 at reduced width", async () => {
   assert.equal(info.video?.width, 640);
 });
 
+test("every non-mix render path is ONE ffmpeg invocation (INVARIANT 1)", async () => {
+  const oneInvocation = (r: { command: string[] }, inputs: number) => {
+    assert.equal(r.command[0], "ffmpeg");
+    assert.equal(r.command.filter((a) => a === "-i").length, inputs);
+    assert.equal(r.command.includes("-shortest"), false);
+    assert.equal(r.command.includes("-t"), false);
+  };
+
+  // plain timeline (no transforms): legacy -af audio chain, single input
+  const plain = await renderPlan(await writePlan("one1.json", plan([
+    { type: "trim", start: 0, end: 4 },
+    { type: "cut", start: 1, end: 2 },
+  ], "one1.mp4")));
+  oneInvocation(plain, 1);
+  assert.ok(plain.command.includes("-af"));
+  assert.equal(plain.command.includes("-filter_complex"), false);
+
+  // transforms + burned captions composition: still one invocation, one input
+  await writeFile("one.srt", "1\n00:00:00,000 --> 00:00:02,000\none pass\n");
+  const composed = await renderPlan(await writePlan("one2.json", plan([
+    { type: "trim", start: 0, end: 6 },
+    { type: "speed", factor: 2 },
+    { type: "resize", width: 640 },
+    { type: "volume", db: -3 },
+    { type: "normalize-audio" },
+    { type: "captions", file: "one.srt" },
+  ], "one2.mp4")));
+  oneInvocation(composed, 1);
+  assert.ok(composed.command.join(" ").includes("subtitles="));
+
+  // preview mode honors the same single-pass contract
+  const prev = await renderPlan(
+    await writePlan("one3.json", plan([{ type: "trim", start: 0, end: 4 }], "one3.mp4")),
+    { mode: "preview" },
+  );
+  oneInvocation(prev, 1);
+});
+
 test("out-of-range timestamp -> TIMESTAMP_OUT_OF_RANGE with operation index", async () => {
   const p = await writePlan("e1.json", plan([{ type: "trim", start: 0, end: 100 }]));
   const r = await validatePlan(p);

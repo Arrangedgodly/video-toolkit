@@ -82,16 +82,15 @@ test("initialize handshake", async () => {
   assert.ok(result.capabilities);
 });
 
-test("tools/list exposes the workflow", async () => {
+test("tools/list exposes exactly the CLI surface (16 tools)", async () => {
   const r = await request("tools/list");
-  const tools = (r.result as { tools: { name: string }[] }).tools.map((t) => t.name);
-  for (const expected of [
-    "video_inspect", "video_plan", "video_validate", "video_preview", "video_render",
-    "video_detect_silence", "video_detect_scenes", "video_extract_frames",
-    "video_generate_proxy", "video_diagnose", "video_benchmark",
-  ]) {
-    assert.ok(tools.includes(expected), `missing ${expected}`);
-  }
+  const tools = (r.result as { tools: { name: string }[] }).tools.map((t) => t.name).sort();
+  assert.deepEqual(tools, [
+    "video_benchmark", "video_captions", "video_detect_filler", "video_detect_scenes",
+    "video_detect_silence", "video_diagnose", "video_extract_frames", "video_find_highlights",
+    "video_generate_proxy", "video_inspect", "video_plan", "video_preview", "video_render",
+    "video_review_frames", "video_transcribe", "video_validate",
+  ]);
 });
 
 test("tools/call: inspect returns the fixture facts", async () => {
