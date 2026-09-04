@@ -83,15 +83,33 @@ test("initialize handshake", async () => {
   assert.ok(result.capabilities);
 });
 
-test("tools/list exposes exactly the CLI surface (17 tools)", async () => {
+test("tools/list exposes exactly the CLI surface (18 tools)", async () => {
   const r = await request("tools/list");
   const tools = (r.result as { tools: { name: string }[] }).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
     "video_benchmark", "video_captions", "video_detect_filler", "video_detect_scenes",
     "video_detect_silence", "video_diagnose", "video_extract_frames", "video_find_highlights",
-    "video_generate_proxy", "video_inspect", "video_plan", "video_preview", "video_render",
-    "video_review_frames", "video_transcribe", "video_transitions", "video_validate",
+    "video_generate_proxy", "video_inspect", "video_measure_loudness", "video_plan",
+    "video_preview", "video_render", "video_review_frames", "video_transcribe",
+    "video_transitions", "video_validate",
   ]);
+});
+
+test("tools/call: measure_loudness returns the fixture's loudness (CLI parity)", async () => {
+  const r = await request("tools/call", { name: "video_measure_loudness", arguments: { input: FIXTURE } });
+  const result = r.result as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(result.isError, true);
+  const data = JSON.parse(result.content[0]!.text) as {
+    inputI: number;
+    inputTP: number;
+    inputLRA: number;
+    params: { targetI: number };
+  };
+  // FIXTURE carries a 440 Hz sine track: a real, finite measurement
+  assert.ok(Number.isFinite(data.inputI));
+  assert.ok(Number.isFinite(data.inputTP));
+  assert.equal(typeof data.inputLRA, "number");
+  assert.deepEqual(data.params, { targetI: -16 });
 });
 
 test("tools/call: transitions returns the live xfade catalog (CLI parity)", async () => {

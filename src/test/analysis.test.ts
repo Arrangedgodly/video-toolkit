@@ -1,11 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { ToolError } from "../core/errors.js";
 import { parseSilenceOutput } from "../analysis/silence.js";
 import { parseSceneOutput } from "../analysis/scenes.js";
+import { parseLoudnormJson } from "../analysis/measure-loudness.js";
 import { silenceToCuts } from "../analysis/silence-to-cuts.js";
 import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
 import { fillerToCuts } from "../analysis/filler-to-cuts.js";
 import { planReviewGroups } from "../analysis/review-frames.js";
+import { LOUDNORM_STDERR_FIXTURE } from "./loudness-fixture.js";
 import {
   detectFillerInstances,
   DEFAULT_FILLER_PHRASES,
@@ -568,5 +571,86 @@ test("fillerToCuts pads expand from the exact word-anchored times", () => {
       { padBefore: 0.1, padEnd: 0.25 },
     ),
     [{ type: "cut", start: 0.9, end: 1.55 }],
+  );
+});
+
+// ---- T15: loudnorm measurement parsing (JSON-block extraction from noisy
+// stderr is the tested part; committed fixture = this build's real output) ----
+
+test("parseLoudnormJson extracts the measurement from the committed noisy stderr", () => {
+  assert.deepEqual(parseLoudnormJson(LOUDNORM_STDERR_FIXTURE), {
+    inputI: -9.05,
+    inputTP: -6.02,
+    inputLRA: 0,
+    inputThresh: -19.05,
+  });
+});
+
+test("parseLoudnormJson ignores banner/progress lines and later non-loudnorm JSON", () => {
+  const stderr = [
+    "[info] starting",
+    "{", // an unrelated brace line mid-stream, never a closed JSON object
+    "frame= 10 fps=0.0 q=-1.0 size=     256KiB time=00:00:00.40 bitrate=5242.8kbits/s speed=1.3x",
+    "[Parsed_loudnorm_0 @ 0x1] ",
+    "{",
+    '\t"input_i" : "-23.75",',
+    '\t"input_tp" : "-6.93",',
+    '\t"input_lra" : "0.10",',
+    '\t"input_thresh" : "-33.85",',
+    '\t"normalization_type" : "dynamic",',
+    '\t"target_offset" : "0.10"',
+    "}",
+    "{ \"unrelated\": true }", // a later JSON object without input_i — skipped
+    "[out#0/null @ 0x2] muxing overhead: unknown",
+  ].join("\n");
+  assert.deepEqual(parseLoudnormJson(stderr), {
+    inputI: -23.75,
+    inputTP: -6.93,
+    inputLRA: 0.1,
+    inputThresh: -33.85,
+  });
+});
+
+test("parseLoudnormJson accepts numeric JSON values too (contract tolerance)", () => {
+  const stderr = '{\n "input_i": -12.5, "input_tp": -3, "input_lra": 7, "input_thresh": -22.5\n}\n';
+  assert.deepEqual(parseLoudnormJson(stderr), {
+    inputI: -12.5,
+    inputTP: -3,
+    inputLRA: 7,
+    inputThresh: -22.5,
+  });
+});
+
+test("parseLoudnormJson passes -inf (digital silence) through as -Infinity", () => {
+  const silence = LOUDNORM_STDERR_FIXTURE.replace(/"-9.05"/, '"-inf"').replace(/"-6.02"/, '"-inf"');
+  const m = parseLoudnormJson(silence);
+  assert.equal(m.inputI, -Infinity);
+  assert.equal(m.inputTP, -Infinity);
+});
+
+test("parseLoudnormJson is deterministic for identical stderr", () => {
+  assert.deepEqual(parseLoudnormJson(LOUDNORM_STDERR_FIXTURE), parseLoudnormJson(LOUDNORM_STDERR_FIXTURE));
+});
+
+test("parseLoudnormJson without a loudnorm block fails FFMPEG_FAILED", () => {
+  for (const stderr of [
+    "", // nothing
+    "Input #0, wav, from 'x.wav':\n  Duration: 00:00:06.00\n", // banner only
+    "[Parsed_somefilter_0 @ 0x1] \n{\"not\":\"loudnorm\"}\n", // JSON, wrong shape
+  ]) {
+    assert.throws(
+      () => parseLoudnormJson(stderr),
+      (e: unknown) => e instanceof ToolError && e.code === "FFMPEG_FAILED",
+      `should refuse stderr: ${JSON.stringify(stderr.slice(0, 40))}`,
+    );
+  }
+});
+
+test("parseLoudnormJson with a non-numeric input field fails FFMPEG_FAILED", () => {
+  const garbage = '{\n\t"input_i" : "not-a-number",\n\t"input_tp" : "-6.02",\n\t"input_lra" : "0.00",\n\t"input_thresh" : "-19.05"\n}\n';
+  assert.throws(
+    () => parseLoudnormJson(garbage),
+    (e: unknown) =>
+      e instanceof ToolError && e.code === "FFMPEG_FAILED" && e.message.includes("input_i"),
   );
 });

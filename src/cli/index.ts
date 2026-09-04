@@ -16,6 +16,7 @@ import { generateProxy } from "../analysis/proxy.js";
 import { transcribeInput } from "../analysis/transcribe/index.js";
 import { detectFillerInstances, DEFAULT_FILLER_PHRASES } from "../analysis/filler.js";
 import { scoreHighlights, DEFAULT_HIGHLIGHT_PARAMS } from "../analysis/highlights.js";
+import { measureLoudness } from "../analysis/measure-loudness.js";
 import { generateCaptions } from "../captions/generate.js";
 import { SceneReport, SilenceReport, TranscriptReport } from "../core/schemas.js";
 
@@ -52,6 +53,9 @@ analysis (timestamped observations; never render):
                              times through the plan's cuts; format from the -o
                              extension or --format srt|vtt (override)
   extract-frame <input>      jpg stills [--at t1,t2] [--count N] [--size W]
+  measure-loudness <input>   source loudness (LUFS/true peak) — the evidence
+                             for normalize-audio targeting (gain = target −
+                             inputI dB); cached observation, writes nothing
   review-frames <input>      grouped stills around scene boundaries
                              --scenes scenes.json [--per-boundary N=4]
                              [--window s=1.5] [--size W=480] [--dir D]
@@ -438,6 +442,11 @@ async function main(): Promise<void> {
           maxCount: f.count ?? DEFAULT_HIGHLIGHT_PARAMS.maxCount,
         }),
       );
+      return;
+    }
+    case "measure-loudness": {
+      if (!input) throw new ToolError("SOURCE_NOT_FOUND", "usage: video measure-loudness <input>");
+      emit(f, await measureLoudness(input, { noCache: f.noCache, debug: debugLine(f) }));
       return;
     }
     case "mcp": {

@@ -288,6 +288,33 @@ export const HighlightReport = z.object({
     .optional(),
 });
 
+/** Loudness first-pass measurement (loudnorm analysis pass; the
+ * `measure-loudness` worker). Values are exactly as loudnorm emits them —
+ * LUFS for inputI/inputThresh, dBTP for inputTP, LU for inputLRA — NOT
+ * rounded (only timestamps round). All four measurement fields are ABSENT
+ * when there is nothing to measure: an audio-less source returns only
+ * `{duration, note}` (the established empty-report pattern), and audio that
+ * loudnorm measures as digital silence (`-inf`) returns the same empty
+ * shape with its own note. */
+export const LoudnessReport = z.object({
+  /** integrated loudness (LUFS) */
+  inputI: z.number().optional(),
+  /** true peak (dBTP) */
+  inputTP: z.number().optional(),
+  /** loudness range (LU) */
+  inputLRA: z.number().optional(),
+  /** integrated-loudness threshold (LUFS, ≈ inputI − 10) */
+  inputThresh: z.number().optional(),
+  duration: z.number().optional(),
+  note: z.string().optional(),
+  params: z
+    .object({
+      /** the loudnorm target I used by the measurement invocation (LUFS) */
+      targetI: z.number(),
+    })
+    .optional(),
+});
+
 /** Compact a ZodError into machine-readable issues with stable paths. */
 export function schemaIssues(error: z.ZodError): {
   path: string;

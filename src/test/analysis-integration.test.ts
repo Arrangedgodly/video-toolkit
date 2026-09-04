@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { runCapture, inspectFile } from "../media/ffprobe.js";
 import { detectSilence } from "../analysis/silence.js";
 import { detectScenes } from "../analysis/scenes.js";
+import { measureLoudness } from "../analysis/measure-loudness.js";
 import { extractFrames } from "../analysis/frames.js";
 import { generateProxy } from "../analysis/proxy.js";
 import { validatePlan } from "../validate/validate.js";
@@ -18,6 +19,12 @@ const SCENES = "scenes.mp4";
 // audio-only: no video stream — the stream-less input on which the four
 // video-needing commands must surface UNSUPPORTED_MEDIA (not INTERNAL)
 const AUDIO = "audio-only.mp3";
+// KNOWN loudness: 0.5-amplitude 1 kHz stationary sine — peak is exactly
+// 20·log10(0.5) = -6.02 dBFS, mono-sine LUFS = -0.691 + 20·log10(0.5/√2)
+// = -9.72 (+ ~0.6 K-weighting at 1 kHz); loudnorm measured -9.05/-6.02 here
+const TONE = "tone05.wav";
+// digital silence — loudnorm reports -inf; the empty-report+note path
+const SILENT = "digital-silence.wav";
 let dir = "";
 
 before(async () => {
@@ -49,6 +56,20 @@ before(async () => {
     "-c:a", "libmp3lame", AUDIO,
   ]);
   assert.equal(au.code, 0, au.stderr);
+
+  const tone = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*1000*t):s=44100:d=6",
+    "-c:a", "pcm_s16le", TONE,
+  ]);
+  assert.equal(tone.code, 0, tone.stderr);
+
+  const silent = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "4",
+    "-c:a", "pcm_s16le", SILENT,
+  ]);
+  assert.equal(silent.code, 0, silent.stderr);
 });
 
 after(async () => {
@@ -511,4 +532,80 @@ test("plan --cuts-from: filler pads expand from the exact word times (full chain
     { type: "cut", start: 0.9, end: 1.65 },
     { type: "cut", start: 1.5, end: 2.65 },
   ]);
+});
+
+// ---- T15: measure-loudness (loudnorm first pass) ----
+
+interface LoudnessCliReport {
+  inputI?: number;
+  inputTP?: number;
+  inputLRA?: number;
+  inputThresh?: number;
+  duration?: number;
+  note?: string;
+  params?: { targetI: number };
+}
+
+test("measure-loudness on a known-level sine matches the computable dBFS/LUFS", async () => {
+  const r = await measureLoudness(TONE);
+  // sine peak = amplitude exactly: 20·log10(0.5) = -6.02 dBFS == dBTP here
+  assert.ok(Math.abs((r.inputTP ?? NaN) - -6.02) < 0.5, `inputTP ${r.inputTP}`);
+  // mono-sine LUFS theory -9.72 (K-weighting adds ~+0.6 at 1 kHz; measured
+  // -9.05 on this build) — 1.5 LU covers theory + weighting + noise
+  assert.ok(Math.abs((r.inputI ?? NaN) - -9.72) < 1.5, `inputI ${r.inputI}`);
+  // stationary tone: zero range, and thresh sits exactly 10 LU under I
+  assert.equal(r.inputLRA, 0);
+  assert.ok(Math.abs(((r.inputI ?? NaN) - (r.inputThresh ?? NaN)) - 10) < 0.1, `thresh ${r.inputThresh}`);
+  assert.ok(Math.abs((r.duration ?? NaN) - 6) < 0.05, `duration ${r.duration}`);
+  assert.deepEqual(r.params, { targetI: -16 });
+});
+
+test("measure-loudness is cached per source (second run hits, same report)", async () => {
+  let sawHit = false;
+  const second = await measureLoudness(TONE, {
+    debug: (l) => {
+      if (l.includes("cache hit: loudness-i-16.json")) sawHit = true;
+    },
+  });
+  assert.ok(sawHit, "second measure-loudness call should hit the cache");
+  assert.deepEqual(second, await measureLoudness(TONE));
+});
+
+test("measure-loudness on a video without audio returns the empty report with note", async () => {
+  const r: LoudnessCliReport = await measureLoudness(SCENES);
+  assert.equal(r.note, "no audio stream");
+  assert.equal(r.inputI, undefined);
+  assert.equal(r.inputTP, undefined);
+  assert.ok(Math.abs((r.duration ?? NaN) - 9) < 0.05, `duration ${r.duration}`);
+});
+
+test("measure-loudness on digital silence (-inf) returns the empty report with note", async () => {
+  const r: LoudnessCliReport = await measureLoudness(SILENT);
+  assert.equal(r.note, "audio measures as silence (loudnorm: -inf)");
+  assert.equal(r.inputI, undefined);
+  assert.ok(Math.abs((r.duration ?? NaN) - 4) < 0.05, `duration ${r.duration}`);
+});
+
+test("measure-loudness CLI: compact single-line JSON, same measurement", async () => {
+  const bin = path.resolve(import.meta.dirname, "..", "cli", "index.js");
+  const r = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+    const child = spawn(process.execPath, [bin, "measure-loudness", TONE]);
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d: Buffer) => (out += d));
+    child.stderr.on("data", (d: Buffer) => (err += d));
+    child.on("close", (code) => resolve({ code, stdout: out, stderr: err }));
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stderr, "");
+  assert.equal(r.stdout.trim().split("\n").length, 1, "compact output is one line");
+  const data = JSON.parse(r.stdout) as LoudnessCliReport;
+  assert.ok(Math.abs((data.inputTP ?? NaN) - -6.02) < 0.5, `inputTP ${data.inputTP}`);
+  assert.deepEqual(data.params, { targetI: -16 });
+});
+
+test("measure-loudness CLI surfaces the no-audio note, not an error", async () => {
+  const r = await runCli<LoudnessCliReport>("measure-loudness", SCENES);
+  assert.equal(r.note, "no audio stream");
+  assert.equal(r.inputI, undefined);
 });

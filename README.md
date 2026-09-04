@@ -62,6 +62,8 @@ video detect-filler <t.json>       filler-word candidates from a transcript
                                    anchors when the transcript carries word
                                    timings, "segments" = estimates)
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
+video measure-loudness <input>     source loudness (LUFS, true peak) — the evidence
+                                   for normalize-audio/volume targeting
 video captions <t.json>            transcript → .srt or .vtt; --plan remaps cue times through cuts
 video extract-frame <input>        jpg stills at --at t1,t2 / --count N
 video review-frames <input>        stills grouped around every scene boundary (--scenes s.json)
@@ -71,6 +73,7 @@ video generate-proxy <input>       low-cost review copy (default 480w, CRF 28)
 - **Observations are cached** per (source fingerprint, parameters) under `.video-agent/cache/` — an unchanged source costs nothing on re-analysis. Workers never modify the source and never render; a video without audio yields an empty report with a `note`, not an error.
 - **Transcription** runs on swappable engines behind one interface. Implemented: **handy** (Parakeet models on Apple Silicon), which emits whole-file text without timestamps — so the worker windows the audio (default 25 s chunks, boundaries snapped to nearby silence; times exact by construction) and can run windows in parallel (`--concurrency N`, byte-identical output to sequential); and **whisper-cpp** (`whisper-cli` on PATH, model under `.video-agent/models/`), which emits native segments from one whole-file invocation — `video transcribe input.mp4 --word-timestamps` selects it (explicitly or implicitly) and adds per-word `segments[].words` timings for exact filler cuts and word-anchored review.
 - **find-highlights** scores transcript segments (speech rate, pause-before emphasis, keyword hits, length band) into deterministic proposals with reasons attached — the agent makes the editorial call.
+- **measure-loudness** runs the loudnorm first pass as a cached observation (integrated loudness in LUFS, true peak, range, threshold; no output file — a probe, not a render), so loudness decisions have evidence: the gain to reach a target is `target − inputI` dB, fed to `normalize-audio.target` or a `volume` op.
 - **Captions** come in two pieces: `video captions transcript.json --plan plan.json -o out.srt` remaps source-timed cues onto the edited output timeline (a cue spanning a cut splits; fragments under 0.3 s drop), and burning them is a plan operation rendered in the same single pass. Output format follows the `-o` extension (`.srt` default or `.vtt` for WebVTT), with `--format srt|vtt` as explicit override.
 
 ### Observation → plan bridges
@@ -163,7 +166,8 @@ media/ffmpeg · media/transitions command builder (argv arrays only) + runner;
                                  live xfade transition catalog (environment query)
 render/                          preview/final settings, single-pass render
 analysis/                        workers: silence, scenes, transcribe, filler,
-                                 highlights, frames, review-frames, proxy
+                                 highlights, frames, review-frames, proxy,
+                                 measure-loudness
 captions/                        srt/vtt generation + timeline cue remapping
 hardware/ · benchmark/           diagnose: capabilities discovered, not assumed;
                                  measured encoder × concurrency matrix

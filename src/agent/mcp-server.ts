@@ -18,6 +18,7 @@ import { generateProxy } from "../analysis/proxy.js";
 import { transcribeInput } from "../analysis/transcribe/index.js";
 import { detectFillerInstances, DEFAULT_FILLER_PHRASES } from "../analysis/filler.js";
 import { scoreHighlights, DEFAULT_HIGHLIGHT_PARAMS } from "../analysis/highlights.js";
+import { measureLoudness } from "../analysis/measure-loudness.js";
 import { generateCaptions } from "../captions/generate.js";
 import { SceneReport, SilenceReport, TranscriptReport } from "../core/schemas.js";
 import { readFile } from "node:fs/promises";
@@ -223,6 +224,16 @@ const TOOLS: ToolDef[] = [
     },
   },
   {
+    name: "video_measure_loudness",
+    description:
+      "Loudness observation (loudnorm first pass): integrated loudness (LUFS), true peak (dBTP), loudness range, threshold of the source audio. Cached per source; writes no media file. The evidence for normalize-audio targeting: gain to reach a target = target − inputI dB, or set normalize-audio.target directly. Audio-less source → {duration, note}.",
+    inputSchema: {
+      type: "object",
+      properties: { input: str },
+      required: ["input"],
+    },
+  },
+  {
     name: "video_transitions",
     description:
       "Crossfade transition kinds available on this ffmpeg build, parsed live from `ffmpeg -h filter=xfade` and cached per version — the discovery surface for a plan's crossfade.kind. Duration guidance: 0.2–1.0 s typical; fade is the cheapest and empirically validated kind; all kinds share the same duration/offset semantics.",
@@ -359,6 +370,8 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       return diagnose();
     case "video_benchmark":
       return benchmarkInput(String(a.input), { seconds: a.seconds as number | undefined });
+    case "video_measure_loudness":
+      return measureLoudness(String(a.input));
     case "video_transitions":
       return catalogTransitions();
     default:
