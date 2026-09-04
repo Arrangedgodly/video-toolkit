@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { access, constants, readFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { fail } from "../../core/errors.js";
 import { round3 } from "../runner.js";
 import type { EngineSegment } from "./engines.js";
@@ -21,6 +22,40 @@ export const WHISPER_CLI = "whisper-cli";
 export const WHISPER_MODELS_DIR = path.join(".video-agent", "models");
 export const WHISPER_DEFAULT_MODEL = "ggml-base.en.bin";
 
+let toolkitRootCache: string | null = null;
+
+/** The toolkit's own install root, derived from THIS module's location
+ * (src|dist /analysis/transcribe/whisper.* → the package root owning
+ * package.json). Showcase defect fix (coordinator-sanctioned): model
+ * resolution was cwd-only, so `video transcribe --word-timestamps` failed
+ * with TRANSCRIPTION_ENGINE_UNAVAILABLE from any cwd outside the repo even
+ * though the model is provisioned at the repo's .video-agent/models. */
+export function whisperToolkitRoot(): string {
+  if (toolkitRootCache === null) {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    let dir = here;
+    while (!existsSync(path.join(dir, "package.json"))) {
+      const parent = path.dirname(dir);
+      if (parent === dir) {
+        // filesystem root hit without a package.json — fall back to the
+        // module's fixed depth (<root>/(src|dist)/analysis/transcribe/)
+        dir = path.resolve(here, "..", "..", "..");
+        break;
+      }
+      dir = parent;
+    }
+    toolkitRootCache = dir;
+  }
+  return toolkitRootCache;
+}
+
+/** Ordered models-dir candidates: the cwd-relative convention first (R2's
+ * table, unchanged), then the toolkit root's own .video-agent/models — so a
+ * model provisioned in the repo resolves from ANY cwd. Injectable for tests. */
+export function whisperModelsDirs(): string[] {
+  return [WHISPER_MODELS_DIR, path.join(whisperToolkitRoot(), WHISPER_MODELS_DIR)];
+}
+
 /** Resolve whisper-cli on PATH (executable bit checked). null when absent. */
 export async function findWhisperCli(): Promise<string | null> {
   const dirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
@@ -36,36 +71,49 @@ export async function findWhisperCli(): Promise<string | null> {
   return null;
 }
 
-/** R2's ordered model-resolution table (binding). Returns the resolved path,
+/** R2's ordered model-resolution table (binding), EXTENDED (defect fix) with
+ * a second location: each name is tried in `<cwd>/.video-agent/models/` and
+ * then in `<toolkit-root>/.video-agent/models/`. Returns the resolved path,
  * or null when nothing resolves (callers turn that into the machine-readable
- * listing error). Explicit paths win verbatim; then the models-dir name;
- * then the provisioned default. whisper-cli itself does NO name magic and
- * NO download, so the engine ALWAYS passes an explicitly resolved `-m`. */
-export function resolveWhisperModel(explicit?: string): string | null {
+ * listing error). Explicit paths win verbatim; then the models-dir name per
+ * location; then the provisioned default per location. whisper-cli itself
+ * does NO name magic and NO download, so the engine ALWAYS passes an
+ * explicitly resolved `-m`. The dirs parameter is injectable for tests. */
+export function resolveWhisperModel(explicit?: string, dirs: string[] = whisperModelsDirs()): string | null {
   if (explicit) {
     if (existsSync(explicit)) return explicit; // rule 1: verbatim
-    const named = path.join(WHISPER_MODELS_DIR, explicit);
-    if (existsSync(named)) return named; // rule 2: models-dir name
+    for (const d of dirs) {
+      const named = path.join(d, explicit);
+      if (existsSync(named)) return named; // rule 2: models-dir name, per location
+    }
     return null;
   }
-  const def = path.join(WHISPER_MODELS_DIR, WHISPER_DEFAULT_MODEL);
-  return existsSync(def) ? def : null; // rule 3: provisioned default
+  for (const d of dirs) {
+    const def = path.join(d, WHISPER_DEFAULT_MODEL);
+    if (existsSync(def)) return def; // rule 3: provisioned default, per location
+  }
+  return null;
 }
 
 /** Rule 4 terminal failure: TRANSCRIPTION_ENGINE_UNAVAILABLE with a sorted
- * `*.bin` listing of the models dir (single-dir scan; empty dir says so). */
-export function whisperModelUnavailable(explicit?: string): never {
-  let known: string[] = [];
-  let dirNote = `${WHISPER_MODELS_DIR}/ not found`;
-  try {
-    known = readdirSync(WHISPER_MODELS_DIR).filter((f) => f.endsWith(".bin")).sort();
-    dirNote = known.length === 0 ? `${WHISPER_MODELS_DIR}/ is empty` : "";
-  } catch {
-    // dir absent — keep the "not found" note
+ * `*.bin` listing of EVERY candidate models dir (paths prefixed by their
+ * dir; absent/empty dirs say so in the note). */
+export function whisperModelUnavailable(explicit?: string, dirs: string[] = whisperModelsDirs()): never {
+  const known: string[] = [];
+  const notes: string[] = [];
+  for (const d of dirs) {
+    try {
+      const bins = readdirSync(d).filter((f) => f.endsWith(".bin"));
+      if (bins.length === 0) notes.push(`${d}/ is empty`);
+      else known.push(...bins.map((f) => path.join(d, f)));
+    } catch {
+      notes.push(`${d}/ not found`);
+    }
   }
+  known.sort();
   return fail("TRANSCRIPTION_ENGINE_UNAVAILABLE", `no whisper.cpp model resolvable for '${explicit ?? "default"}'`, {
     known,
-    ...(dirNote ? { note: dirNote } : {}),
+    ...(notes.length > 0 ? { note: notes.join("; ") } : {}),
   });
 }
 

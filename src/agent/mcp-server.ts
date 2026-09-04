@@ -133,7 +133,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "video_transcribe",
     description:
-      "Timestamped transcript. Engines: handy (Parakeet; windowed, boundaries snapped to silence, windows run with bounded parallelism via concurrency, default 1 or the cached benchmark recommendation — report byte-identical to sequential) or whisper-cpp (native segments from ONE whole-file invocation; chunk/concurrency are no-ops). word_timestamps=true requests per-word times (segments[].words) and selects whisper-cpp when no engine is given. Model resolution (whisper-cpp): explicit resolvable path > .video-agent/models/<name> > default ggml-base.en.bin, else TRANSCRIPTION_ENGINE_UNAVAILABLE listing known models. Cached per source+engine+model+chunk (+words flag for whisper-cpp).",
+      "Timestamped transcript. Engines: handy (Parakeet; windowed, boundaries snapped to silence, windows run with bounded parallelism via concurrency, default 1 or the cached benchmark recommendation — report byte-identical to sequential) or whisper-cpp (native segments from ONE whole-file invocation; chunk/concurrency are no-ops). word_timestamps=true requests per-word times (segments[].words) and selects whisper-cpp when no engine is given. Model resolution (whisper-cpp): explicit resolvable path > .video-agent/models/<name> in the cwd, then under the toolkit root's .video-agent/models/ > default ggml-base.en.bin at the same two locations, else TRANSCRIPTION_ENGINE_UNAVAILABLE listing known models (both dirs). Cached per source+engine+model+chunk (+words flag for whisper-cpp).",
     inputSchema: {
       type: "object",
       properties: {

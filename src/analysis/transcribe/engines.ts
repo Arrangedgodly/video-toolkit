@@ -87,7 +87,8 @@ export const whisperEngine: TranscriptionEngine = {
     const bin = await findWhisperCli();
     const model = resolveWhisperModel();
     const binFact = bin ?? "whisper-cli not found on PATH";
-    const modelFact = model ?? `default model ${WHISPER_DEFAULT_MODEL} not found in .video-agent/models/`;
+    const modelFact =
+      model ?? `default model ${WHISPER_DEFAULT_MODEL} not found in .video-agent/models/ (cwd) nor <toolkit-root>/.video-agent/models/`;
     return { available: bin !== null && model !== null, detail: `${binFact}; ${modelFact}` };
   },
   async transcribeWav() {

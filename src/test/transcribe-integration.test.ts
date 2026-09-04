@@ -1,13 +1,14 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir, symlink } from "node:fs/promises";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { runCapture } from "../media/ffprobe.js";
 import { transcribeInput } from "../analysis/transcribe/index.js";
 import { findHandy } from "../analysis/transcribe/handy.js";
-import { findWhisperCli, resolveWhisperModel } from "../analysis/transcribe/whisper.js";
+import { findWhisperCli, resolveWhisperModel, whisperToolkitRoot } from "../analysis/transcribe/whisper.js";
 import { detectFillerInstances } from "../analysis/filler.js";
 
 // Real end-to-end: macOS `say` speech muxed into an mp4, transcribed by the
@@ -202,6 +203,44 @@ test("transcribe: whisper-cpp without --word-timestamps -> segments, no words; c
     w1lines.join("; "),
   );
   assert.ok(hit.segments.every((s) => s.words && s.words.length >= 1));
+});
+
+test("transcribe: CLI from a NON-repo cwd resolves the toolkit-root model (showcase defect fix)", { skip: !whisperAvailable }, async () => {
+  // fresh cwd with NO .video-agent at all — pre-fix (cwd-only resolution)
+  // this exited TRANSCRIPTION_ENGINE_UNAVAILABLE even though the model is
+  // provisioned at the repo's .video-agent/models
+  const elsewhere = await mkdtemp(path.join(tmpdir(), "video-toolkit-norepo-"));
+  try {
+    const bin = path.resolve(import.meta.dirname, "..", "cli", "index.js");
+    const r = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(
+        process.execPath,
+        [bin, "transcribe", path.resolve(dir, FIXTURE), "--word-timestamps", "--no-cache"],
+        { cwd: elsewhere },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => (stdout += d));
+      child.stderr.on("data", (d: Buffer) => (stderr += d));
+      child.on("error", () => resolve({ code: -1, stdout, stderr }));
+      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    });
+    assert.equal(r.code, 0, r.stderr);
+    const report = JSON.parse(r.stdout) as {
+      engine?: string;
+      model?: string;
+      segments?: { words?: unknown[] }[];
+    };
+    assert.equal(report.engine, "whisper-cpp");
+    // the model resolved from the TOOLKIT ROOT (absolute), not the absent cwd dir
+    assert.equal(report.model, path.join(whisperToolkitRoot(), ".video-agent", "models", "ggml-base.en.bin"));
+    assert.ok((report.segments ?? []).length >= 1, r.stdout.slice(0, 200));
+    assert.ok((report.segments ?? []).every((s) => Array.isArray(s.words) && s.words.length >= 1));
+    // resolution never went through the cwd: no .video-agent created there
+    assert.equal(existsSync(path.join(elsewhere, ".video-agent")), false);
+  } finally {
+    await rm(elsewhere, { recursive: true, force: true });
+  }
 });
 
 // ---- T11: filler precision on a REAL word-timestamped transcript ----

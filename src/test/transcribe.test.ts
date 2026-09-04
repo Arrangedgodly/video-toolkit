@@ -12,8 +12,13 @@ import {
   mergeWhisperWords,
   resolveWhisperModel,
   whisperModelUnavailable,
+  whisperModelsDirs,
+  whisperToolkitRoot,
   findWhisperCli,
+  WHISPER_MODELS_DIR,
+  WHISPER_DEFAULT_MODEL,
 } from "../analysis/transcribe/whisper.js";
+import { existsSync } from "node:fs";
 import { Cache } from "../cache/cache.js";
 import { ToolError, fail } from "../core/errors.js";
 import { runCapture } from "../media/ffprobe.js";
@@ -523,64 +528,106 @@ test("transcribe: native cache key transcript-<engine>-<model>-c0-w<0|1>.json; w
   }
 });
 
-test("transcribe: --word-timestamps with no engine selects whisper-cpp; unavailable -> TRANSCRIPTION_ENGINE_UNAVAILABLE", async () => {
-  // unit tmp cwd has no .video-agent/models -> the whisper-cpp engine is
-  // unavailable here no matter the binary; the failure must name it
+test("transcribe: --word-timestamps with no engine selects whisper-cpp; unresolvable model -> TRANSCRIPTION_ENGINE_UNAVAILABLE", async () => {
+  // the unavailable path is forced deterministically by an explicit model
+  // name that resolves in NO location (cwd or toolkit root — two-location
+  // resolution since the showcase defect fix); machine state (whisper-cli
+  // installed, repo model provisioned) only decides WHICH layer throws
+  // (engine detect vs model resolution) — both the same error code
   await assert.rejects(
-    transcribeInput(FIXTURE, { wordTimestamps: true, noCache: true }),
+    transcribeInput(FIXTURE, { wordTimestamps: true, model: "definitely-missing.bin", noCache: true }),
     (e: unknown) =>
       e instanceof ToolError &&
       e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
-      /whisper-cpp/.test(e.message),
+      /whisper[-.]cpp/.test(e.message),
   );
 });
 
-test("whisper model resolution: R2 ordered table (explicit path > models-dir name > default > listing error)", async () => {
-  const modelsDir = path.join(".video-agent", "models");
-  await mkdir(modelsDir, { recursive: true });
+test("whisper toolkit root: derived from the module location, not the cwd", () => {
+  const root = whisperToolkitRoot();
+  // this test module sits at <root>/(src|dist)/test/ — same package root as
+  // the whisper module's <root>/(src|dist)/analysis/transcribe/
+  assert.equal(root, path.resolve(import.meta.dirname, "..", ".."));
+  assert.ok(existsSync(path.join(root, "package.json")));
+  assert.deepEqual(whisperModelsDirs(), [WHISPER_MODELS_DIR, path.join(root, WHISPER_MODELS_DIR)]);
+});
+
+test("whisper model resolution: ordered table (explicit path > cwd name > toolkit-root name > default > listing error)", async () => {
+  // fake dirs stand in for the two locations (the cwd convention and the
+  // toolkit root) so the order is deterministic regardless of what the real
+  // repo provisions on this machine
+  const cwdDir = path.join(".video-agent", "models");
+  const rootDir = path.join("fake-toolkit-root", ".video-agent", "models");
+  const dirs = [cwdDir, rootDir];
   try {
-    await writeFile(path.join(modelsDir, "aa.bin"), "");
-    await writeFile(path.join(modelsDir, "ggml-base.en.bin"), "");
+    await mkdir(cwdDir, { recursive: true });
+    await mkdir(rootDir, { recursive: true });
+    await writeFile(path.join(cwdDir, "aa.bin"), "");
+    await writeFile(path.join(cwdDir, "ggml-base.en.bin"), "");
     await writeFile("explicit.bin", "");
-    await writeFile(path.join(modelsDir, "dup.bin"), "");
-    await writeFile("dup.bin", "");
+    await writeFile(path.join(cwdDir, "dup.bin"), "");
+    await writeFile(path.join(rootDir, "dup.bin"), "");
+    await writeFile(path.join(rootDir, "root-only.bin"), "");
 
     // rule 1: explicit existing path wins verbatim (even over a models-dir name)
-    assert.equal(resolveWhisperModel("explicit.bin"), "explicit.bin");
-    assert.equal(resolveWhisperModel("dup.bin"), "dup.bin");
-    // rule 2: models-dir name
-    assert.equal(resolveWhisperModel("aa.bin"), path.join(modelsDir, "aa.bin"));
-    // rule 3: provisioned default
-    assert.equal(resolveWhisperModel(undefined), path.join(modelsDir, "ggml-base.en.bin"));
-    // rule 4: unresolvable -> null + machine-readable listing
-    assert.equal(resolveWhisperModel("missing.bin"), null);
+    assert.equal(resolveWhisperModel("explicit.bin", dirs), "explicit.bin");
+    // same name in BOTH dirs -> the cwd-dir copy wins
+    assert.equal(resolveWhisperModel("dup.bin", dirs), path.join(cwdDir, "dup.bin"));
+    // cwd-dir name
+    assert.equal(resolveWhisperModel("aa.bin", dirs), path.join(cwdDir, "aa.bin"));
+    // second-location fallback: a name only in the toolkit-root dir resolves there
+    assert.equal(resolveWhisperModel("root-only.bin", dirs), path.join(rootDir, "root-only.bin"));
+    // rule 3: provisioned default — cwd dir first, toolkit root as fallback
+    assert.equal(resolveWhisperModel(undefined, dirs), path.join(cwdDir, "ggml-base.en.bin"));
+    await rm(path.join(cwdDir, "ggml-base.en.bin"), { force: true });
+    await writeFile(path.join(rootDir, "ggml-base.en.bin"), "");
+    assert.equal(resolveWhisperModel(undefined, dirs), path.join(rootDir, "ggml-base.en.bin"));
+    // rule 4: unresolvable -> null + machine-readable listing of BOTH dirs
+    assert.equal(resolveWhisperModel("missing.bin", dirs), null);
     assert.throws(
-      () => whisperModelUnavailable("missing.bin"),
+      () => whisperModelUnavailable("missing.bin", dirs),
       (e: unknown) =>
         e instanceof ToolError &&
         e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
-        JSON.stringify((e as ToolError).details?.known) === JSON.stringify(["aa.bin", "dup.bin", "ggml-base.en.bin"]),
+        JSON.stringify((e as ToolError).details?.known) ===
+          JSON.stringify(
+            [
+              path.join(cwdDir, "aa.bin"),
+              path.join(cwdDir, "dup.bin"),
+              path.join(rootDir, "dup.bin"),
+              path.join(rootDir, "ggml-base.en.bin"),
+              path.join(rootDir, "root-only.bin"),
+            ].sort(),
+          ),
     );
   } finally {
-    await rm(modelsDir, { recursive: true, force: true });
+    await rm(cwdDir, { recursive: true, force: true });
+    await rm("fake-toolkit-root", { recursive: true, force: true });
     await rm("explicit.bin", { force: true });
-    await rm("dup.bin", { force: true });
   }
-  // absent models dir -> null + note says so
-  assert.equal(resolveWhisperModel(undefined), null);
+  // both dirs absent -> null + note names both locations
+  assert.equal(resolveWhisperModel(undefined, ["nope-a", "nope-b"]), null);
   assert.throws(
-    () => whisperModelUnavailable(),
+    () => whisperModelUnavailable(undefined, ["nope-a", "nope-b"]),
     (e: unknown) =>
       e instanceof ToolError && e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
-      String((e as ToolError).details?.note).includes("not found"),
+      String((e as ToolError).details?.note).includes("nope-a/") &&
+      String((e as ToolError).details?.note).includes("nope-b/"),
   );
+  // real defaults: with no cwd models dir, a repo-provisioned default model
+  // resolves from the toolkit root (the showcase defect scenario)
+  const repoDefault = path.join(whisperToolkitRoot(), WHISPER_MODELS_DIR, WHISPER_DEFAULT_MODEL);
+  if (existsSync(repoDefault)) {
+    assert.equal(resolveWhisperModel(undefined), repoDefault);
+  }
 });
 
-test("whisper detect(): binary+model facts in the detail (no models dir -> unavailable)", async () => {
+test("whisper detect(): binary+model facts in the detail (model may resolve from cwd OR toolkit root)", async () => {
   const { whisperEngine } = await import("../analysis/transcribe/engines.js");
   const d = await whisperEngine.detect();
   const hasCli = (await findWhisperCli()) !== null;
-  assert.equal(d.available, false); // no default model in the unit tmp cwd
-  assert.ok(d.detail.includes("whisper-cli") || hasCli === false);
-  assert.ok(d.detail.includes("ggml-base.en.bin"));
+  const hasModel = resolveWhisperModel() !== null; // real defaults: both locations
+  assert.equal(d.available, hasCli && hasModel);
+  assert.ok(d.detail.includes("whisper-cli")); // path when found, "not found" otherwise
+  assert.ok(d.detail.includes("ggml-base.en.bin")); // path or the not-found fact
 });
