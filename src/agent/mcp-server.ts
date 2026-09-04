@@ -131,7 +131,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "video_transcribe",
     description:
-      "Timestamped transcript (windowed; boundaries snapped to silence; windows run with bounded parallelism via concurrency, default 1 or the cached benchmark recommendation — report byte-identical to sequential). Engine: handy (Parakeet). Cached per source+engine+model+chunk.",
+      "Timestamped transcript. Engines: handy (Parakeet; windowed, boundaries snapped to silence, windows run with bounded parallelism via concurrency, default 1 or the cached benchmark recommendation — report byte-identical to sequential) or whisper-cpp (native segments from ONE whole-file invocation; chunk/concurrency are no-ops). word_timestamps=true requests per-word times (segments[].words) and selects whisper-cpp when no engine is given. Model resolution (whisper-cpp): explicit resolvable path > .video-agent/models/<name> > default ggml-base.en.bin, else TRANSCRIPTION_ENGINE_UNAVAILABLE listing known models. Cached per source+engine+model+chunk (+words flag for whisper-cpp).",
     inputSchema: {
       type: "object",
       properties: {
@@ -141,6 +141,7 @@ const TOOLS: ToolDef[] = [
         chunk_seconds: { type: "number" },
         snap_to_silence: { type: "boolean" },
         concurrency: { type: "number" },
+        word_timestamps: { type: "boolean" },
       },
       required: ["input"],
     },
@@ -281,6 +282,7 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
         chunkSeconds: a.chunk_seconds as number | undefined,
         snapToSilence: a.snap_to_silence as boolean | undefined,
         concurrency: a.concurrency as number | undefined,
+        wordTimestamps: a.word_timestamps === true,
       });
     case "video_detect_filler": {
       let doc: unknown;

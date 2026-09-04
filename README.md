@@ -13,7 +13,7 @@ Editing video with an agent (or a shell) usually means stringing together FFmpeg
 
 - Node.js ≥ 20
 - `ffmpeg` and `ffprobe` on `PATH` — burned captions additionally require a build with **libass** (e.g. Homebrew's `ffmpeg-full`); `video diagnose` reports what your build supports
-- Optional: Handy.app on macOS for on-device transcription (see [engines](./AGENTS.md#engines-transcription)) — without an engine, `transcribe` fails with the machine-readable `TRANSCRIPTION_ENGINE_UNAVAILABLE` instead of guessing
+- Optional transcription engines (see [engines](./AGENTS.md#engines-transcription)): Handy.app on macOS (Parakeet, the default) and/or `whisper-cli` (whisper.cpp) with a model in `.video-agent/models/` (default name `ggml-base.en.bin`) — without a resolvable engine, `transcribe` fails with the machine-readable `TRANSCRIPTION_ENGINE_UNAVAILABLE` instead of guessing
 
 ## Quickstart
 
@@ -54,7 +54,8 @@ video benchmark <input>    measure fastest encoder/concurrency on this machine
 ```
 video detect-silence <input>       silence gaps
 video detect-scenes <input>        scene-cut boundaries
-video transcribe <input>           timestamped transcript (--concurrency N = parallel windows)
+video transcribe <input>           timestamped transcript (--engine handy|whisper-cpp;
+                                   --word-timestamps = per-word times via whisper-cpp)
 video detect-filler <t.json>       filler-word candidates from a transcript
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
 video captions <t.json>            transcript → .srt or .vtt; --plan remaps cue times through cuts
@@ -64,7 +65,7 @@ video generate-proxy <input>       low-cost review copy (default 480w, CRF 28)
 ```
 
 - **Observations are cached** per (source fingerprint, parameters) under `.video-agent/cache/` — an unchanged source costs nothing on re-analysis. Workers never modify the source and never render; a video without audio yields an empty report with a `note`, not an error.
-- **Transcription** runs on swappable engines behind one interface. Implemented: **handy** (Parakeet models on Apple Silicon), which emits whole-file text without timestamps — so the worker windows the audio (default 25 s chunks, boundaries snapped to nearby silence; times exact by construction) and can run windows in parallel (`--concurrency N`, byte-identical output to sequential).
+- **Transcription** runs on swappable engines behind one interface. Implemented: **handy** (Parakeet models on Apple Silicon), which emits whole-file text without timestamps — so the worker windows the audio (default 25 s chunks, boundaries snapped to nearby silence; times exact by construction) and can run windows in parallel (`--concurrency N`, byte-identical output to sequential); and **whisper-cpp** (`whisper-cli` on PATH, model under `.video-agent/models/`), which emits native segments from one whole-file invocation — `video transcribe input.mp4 --word-timestamps` selects it (explicitly or implicitly) and adds per-word `segments[].words` timings for exact filler cuts and word-anchored review.
 - **find-highlights** scores transcript segments (speech rate, pause-before emphasis, keyword hits, length band) into deterministic proposals with reasons attached — the agent makes the editorial call.
 - **Captions** come in two pieces: `video captions transcript.json --plan plan.json -o out.srt` remaps source-timed cues onto the edited output timeline (a cue spanning a cut splits; fragments under 0.3 s drop), and burning them is a plan operation rendered in the same single pass. Output format follows the `-o` extension (`.srt` default or `.vtt` for WebVTT), with `--format srt|vtt` as explicit override.
 

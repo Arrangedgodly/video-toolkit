@@ -175,10 +175,19 @@ export const SceneReport = z.object({
   params: z.object({ threshold: z.number() }).optional(),
 });
 
+export const WordTiming = z.object({
+  start: z.number(),
+  end: z.number(),
+  text: z.string(),
+});
 export const TranscriptSegment = z.object({
   start: z.number(),
   end: z.number(),
   text: z.string(),
+  /** per-word timings (seconds, 3 decimals); present only when the engine
+   * produced them (whisper-cpp `--word-timestamps`) — consumers must treat
+   * absence as "segment granularity only" */
+  words: z.array(WordTiming).optional(),
 });
 export const TranscriptReport = z.object({
   segments: z.array(TranscriptSegment),
@@ -189,9 +198,11 @@ export const TranscriptReport = z.object({
   note: z.string().optional(),
   params: z
     .object({
-      chunkSeconds: z.number(),
-      snapToSilence: z.boolean(),
+      chunkSeconds: z.number().optional(),
+      snapToSilence: z.boolean().optional(),
       model: z.string().optional(),
+      /** native-segment engines (no windowing) record the words flag here */
+      wordTimestamps: z.boolean().optional(),
     })
     .optional(),
 });

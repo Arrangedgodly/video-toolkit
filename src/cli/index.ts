@@ -34,10 +34,14 @@ commands:
 analysis (timestamped observations; never render):
   detect-silence <input>     silence gaps [--threshold dB] [--min-duration s]
   detect-scenes <input>      scene-cut boundaries [--threshold 0..1]
-  transcribe <input>         timestamped transcript [--engine handy] [--model ID]
+  transcribe <input>         timestamped transcript [--engine handy|whisper-cpp]
+                             [--model ID (handy) | path/name (whisper-cpp)]
+                             [--word-timestamps (per-word times; selects
+                             whisper-cpp when no --engine is given)]
                              [--chunk s] [--no-snap (silence boundary snapping)]
                              [--concurrency N (parallel windows; default 1 or
-                             the cached benchmark recommendation)]
+                             the cached benchmark recommendation; no-op for
+                             whisper-cpp — one whole-file invocation)]
   detect-filler <transcript.json>  filler-word candidates [--words "um,uh,..."]
   find-highlights <input>    highlight proposals from --transcript t.json
                              [--keywords "a,b,c"] [--min-score 0.35] [--count 5]
@@ -100,6 +104,7 @@ interface CliFlags {
   chunk?: number;
   concurrency?: number;
   noSnap?: boolean;
+  wordTimestamps?: boolean;
   words?: string;
   transcript?: string;
   keywords?: string;
@@ -147,6 +152,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--chunk") f.chunk = Number(argv[++i]);
     else if (a === "--concurrency") f.concurrency = Number(argv[++i]);
     else if (a === "--no-snap") f.noSnap = true;
+    else if (a === "--word-timestamps") f.wordTimestamps = true;
     else if (a === "--words") f.words = argv[++i];
     else if (a === "--transcript") f.transcript = argv[++i];
     else if (a === "--keywords") f.keywords = argv[++i];
@@ -347,6 +353,7 @@ async function main(): Promise<void> {
           chunkSeconds: f.chunk,
           snapToSilence: f.noSnap ? false : undefined,
           concurrency: f.concurrency,
+          wordTimestamps: f.wordTimestamps,
           noCache: f.noCache,
           debug: debugLine(f),
         }),

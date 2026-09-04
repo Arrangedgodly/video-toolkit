@@ -8,7 +8,7 @@ import { TranscriptReport } from "../../core/schemas.js";
 import { fail } from "../../core/errors.js";
 import { detectSilence } from "../silence.js";
 import { planWindows } from "./windows.js";
-import { resolveEngine } from "./engines.js";
+import { ENGINES, resolveEngine } from "./engines.js";
 import type { z } from "zod";
 
 export type TranscriptReportData = z.infer<typeof TranscriptReport>;
@@ -23,8 +23,13 @@ export interface TranscribeOpts extends AnalysisOpts {
    * one independent engine process). Default: the cached `video benchmark`
    * recommendation for this source when present, else 1 (conservative —
    * every engine invocation loads its own model). Not part of the cache
-   * key: the report is byte-identical to sequential. */
+   * key: the report is byte-identical to sequential. No-op for native-
+   * segment engines (one whole-file invocation). */
   concurrency?: number;
+  /** request per-word timestamps; selects a word-capable engine (implicit
+   * engine = whisper-cpp when no --engine is given). Part of the cache
+   * key for native-segment engines: toggling the flag misses a warm cache. */
+  wordTimestamps?: boolean;
 }
 
 function cacheSafe(s: string): string {
@@ -89,13 +94,15 @@ async function defaultConcurrency(input: string): Promise<number> {
 }
 
 /**
- * Transcribe any media file into timestamped segments. Audio is cut into
- * windows (snapped to silence), each window is transcoded to 16kHz mono WAV
- * and handed to the engine; segment times are exact because we made the cuts.
- * Windows run with bounded parallelism (`concurrency`; each is an independent
- * engine process) and the report is byte-identical to the sequential path.
- * Cached per (source fingerprint, engine, model, chunk size) — concurrency is
- * deliberately NOT part of the cache key.
+ * Transcribe any media file into timestamped segments. Native-segment engines
+ * (whisper-cpp) are honored with ONE whole-file 16kHz mono WAV invocation —
+ * no windowing, no silence snap (--chunk/--concurrency are no-ops), segments
+ * and optional per-word times come from the engine itself. Whole-text engines
+ * (handy) are cut into windows (snapped to silence), each transcoded to
+ * 16kHz mono WAV and stamped with its exact time range; windows run with
+ * bounded parallelism and the report is byte-identical to the sequential
+ * path. Cached per (source fingerprint, engine, model, chunk size [+ words
+ * flag for native engines]) — concurrency is deliberately NOT in the key.
  */
 export async function transcribeInput(
   input: string,
@@ -109,15 +116,83 @@ export async function transcribeInput(
       concurrency: opts.concurrency,
     });
   }
-  const engine = await resolveEngine(opts.engine);
+  if (opts.wordTimestamps) {
+    // param guard BEFORE any engine work: an explicit word-incapable engine
+    // (no transcribeSegments) can never satisfy --word-timestamps
+    const explicit = opts.engine ? ENGINES.find((e) => e.id === opts.engine) : undefined;
+    if (explicit && !explicit.transcribeSegments) {
+      fail("OPERATION_INVALID", `--word-timestamps requires a word-capable engine; '${explicit.id}' emits whole-file text only`, {
+        engine: explicit.id,
+        known: ENGINES.filter((e) => e.transcribeSegments).map((e) => e.id),
+      });
+    }
+  }
+  const engine = await resolveEngine(
+    opts.wordTimestamps && !opts.engine ? "whisper-cpp" : opts.engine,
+  );
   const chunk = opts.chunkSeconds ?? 25;
   const snap = opts.snapToSilence !== false;
+
+  // native-segment engines: c0 = no chunking (the windowed path always keys
+  // its real chunk value, >= 2 in practice), w<0|1> = the words flag — so the
+  // two families can never collide and toggling words misses the warm cache
+  const cacheName = engine.transcribeSegments
+    ? `transcript-${engine.id}-${cacheSafe(opts.model ?? "default")}-c0-w${opts.wordTimestamps ? 1 : 0}.json`
+    : `transcript-${engine.id}-${cacheSafe(opts.model ?? "default")}-c${chunk}.json`;
+
+  if (engine.transcribeSegments) {
+    return runAnalysis<TranscriptReportData>(
+      input,
+      { ...opts, cacheName },
+      async ({ media }) => {
+        if (!media.audio || media.duration <= 0) {
+          return TranscriptReport.parse({
+            segments: [],
+            duration: round3(media.duration),
+            engine: engine.id,
+            note: "no audio stream",
+          });
+        }
+        const debug = opts.debug ?? (() => {});
+        debug(`transcribe: ${engine.id} native segments, whole-file (no windows), words=${opts.wordTimestamps === true}`);
+        const tmp = await mkdtemp(path.join(tmpdir(), "video-transcribe-"));
+        try {
+          const wav = path.join(tmp, "full.wav");
+          await runFFmpeg([
+            "-nostdin", "-hide_banner", "-y",
+            "-i", input,
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            wav,
+          ]);
+          const r = await engine.transcribeSegments!(wav, {
+            model: opts.model,
+            words: opts.wordTimestamps,
+            durationSecs: media.duration,
+          });
+          const wordCount = r.segments.reduce((n, s) => n + (s.words?.length ?? 0), 0);
+          debug(
+            `whisper: ${r.segments.length} segment(s), ${wordCount} word(s): ${r.segments.map((s) => s.text).join(" ").slice(0, 60)}`,
+          );
+          return TranscriptReport.parse({
+            segments: r.segments,
+            duration: round3(media.duration),
+            engine: engine.id,
+            model: r.model,
+            ...(r.language ? { language: r.language } : {}),
+            params: { model: opts.model, wordTimestamps: opts.wordTimestamps === true },
+          });
+        } finally {
+          await rm(tmp, { recursive: true, force: true });
+        }
+      },
+    );
+  }
 
   return runAnalysis<TranscriptReportData>(
     input,
     {
       ...opts,
-      cacheName: `transcript-${engine.id}-${cacheSafe(opts.model ?? "default")}-c${chunk}.json`,
+      cacheName,
     },
     async ({ media }) => {
       if (!media.audio || media.duration <= 0) {

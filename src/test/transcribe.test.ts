@@ -1,16 +1,24 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readdir } from "node:fs/promises";
+import { mkdtemp, rm, readdir, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { planWindows } from "../analysis/transcribe/windows.js";
 import { parseHandyJson } from "../analysis/transcribe/handy.js";
 import { transcribeInput, mapBounded, concurrencyFromBenchmark } from "../analysis/transcribe/index.js";
 import { ENGINES, type TranscriptionEngine } from "../analysis/transcribe/engines.js";
+import {
+  parseWhisperOjf,
+  mergeWhisperWords,
+  resolveWhisperModel,
+  whisperModelUnavailable,
+  findWhisperCli,
+} from "../analysis/transcribe/whisper.js";
 import { Cache } from "../cache/cache.js";
 import { ToolError, fail } from "../core/errors.js";
 import { runCapture } from "../media/ffprobe.js";
 import { detectFillerInstances } from "../analysis/filler.js";
+import { WHISPER_OJF_FIXTURE } from "./whisper-fixture.js";
 
 test("windows: fixed chunking without silences", () => {
   const w = planWindows(100, 25);
@@ -292,4 +300,284 @@ test("transcribe: cache key unchanged — warm cache hits regardless of concurre
     lines.join("; "),
   );
   assert.equal(JSON.stringify(hit), JSON.stringify(first));
+});
+
+// ---- T10: whisper-cpp engine — parser (committed fixture), routing, cache key ----
+// No live whisper-cli here: the parser runs against the committed fixture
+// (src/test/whisper-fixture.ts, captured from the R2-committed invocation);
+// routing/cache tests use fake native engines.
+
+test("whisper merge: specials skipped, leading space starts a word, tails append+extend", () => {
+  const w = mergeWhisperWords([
+    { text: "[_BEG_]", offsets: { from: 0, to: 0 } },
+    { text: " Um", offsets: { from: 10, to: 140 } },
+    { text: ",", offsets: { from: 140, to: 270 } },
+    { text: " you", offsets: { from: 400, to: 500 } },
+    { text: "[_TT_198]", offsets: { from: 3960, to: 3960 } },
+  ]);
+  assert.deepEqual(w, [
+    { text: "Um,", start: 10, end: 270 },
+    { text: "you", start: 400, end: 500 },
+  ]);
+});
+
+test("whisper merge: BPE continuation pieces append without extending end backwards", () => {
+  const w = mergeWhisperWords([
+    { text: " align", offsets: { from: 100, to: 200 } },
+    { text: "ment", offsets: { from: 150, to: 180 } }, // tail ends BEFORE the word's end
+    { text: ".", offsets: { from: 260, to: 300 } },
+  ]);
+  assert.deepEqual(w, [{ text: "alignment.", start: 100, end: 300 }]); // end = max(...)
+});
+
+test("whisper merge: zero-width word repaired from the next word in the SAME segment; last stays zero", () => {
+  const w = mergeWhisperWords([
+    { text: " So", offsets: { from: 4320, to: 4320 } },
+    { text: " basically", offsets: { from: 4330, to: 5400 } },
+    { text: " end", offsets: { from: 6000, to: 6000 } }, // no next word -> left as-is
+  ]);
+  assert.deepEqual(w.map((x) => [x.start, x.end]), [[4320, 4330], [4330, 5400], [6000, 6000]]);
+});
+
+test("whisper merge: repair never invents data when the next word starts at the same time", () => {
+  const w = mergeWhisperWords([
+    { text: " know", offsets: { from: 13360, to: 13360 } },
+    { text: " what", offsets: { from: 13360, to: 13570 } },
+  ]);
+  assert.deepEqual(w.map((x) => [x.start, x.end]), [[13360, 13360], [13360, 13570]]);
+});
+
+test("whisper parser: committed fixture -> segments + words per the R2 contract", () => {
+  const { segments, language } = parseWhisperOjf(WHISPER_OJF_FIXTURE);
+  assert.equal(language, "en");
+  assert.equal(segments.length, 3);
+  // ms -> seconds at 3 decimals (INVARIANT 4)
+  assert.deepEqual(
+    segments.map((s) => [s.start, s.end]),
+    [[0, 3.96], [4.32, 9.36], [9.76, 14]],
+  );
+  assert.equal(segments[0]!.text, "Um, you know, I was basically thinking about the alignment problem.");
+  // punctuation merge: "Um" + "," ; word text keeps emitted punctuation
+  const s0 = segments[0]!.words!;
+  assert.equal(s0[0]!.text, "Um,");
+  assert.equal(s0[0]!.start, 0.01);
+  assert.equal(s0[0]!.end, 0.27);
+  assert.equal(s0[s0.length - 1]!.text, "problem."); // trailing "." appended
+  assert.equal(s0[s0.length - 1]!.end, 3.96); // degenerate token extended to segment end
+  // deterministic repair visible in seg1 (So 4320->4330) and seg2 (know stays zero-width)
+  const s1 = segments[1]!.words!;
+  assert.equal(s1[0]!.text, "So");
+  assert.deepEqual([s1[0]!.start, s1[0]!.end], [4.32, 4.33]);
+  const s2 = segments[2]!.words!;
+  const know = s2.find((w) => w.text === "know")!;
+  assert.deepEqual([know.start, know.end], [13.36, 13.36]);
+  // sanity contract: ordered, non-overlapping, within segment bounds, 3 decimals
+  for (const seg of segments) {
+    let prevEnd = seg.start;
+    for (const w of seg.words!) {
+      assert.ok(w.start >= prevEnd - 0.0005, `word overlap at ${w.start} after ${prevEnd}: ${w.text}`);
+      assert.ok(w.end >= w.start, `negative span: ${w.text}`);
+      assert.ok(w.start >= seg.start - 0.0005 && w.end <= seg.end + 0.0005, `out of bounds: ${w.text}`);
+      assert.ok(Number.isInteger(Math.round(w.start * 1000)) && Number.isInteger(Math.round(w.end * 1000)));
+      prevEnd = w.end;
+    }
+  }
+  assert.equal(segments.reduce((n, s) => n + s.words!.length, 0), 39); // 11 + 13 + 15
+});
+
+test("whisper parser: invalid JSON -> TRANSCRIPTION_ENGINE_FAILED; empty-text segments skipped", () => {
+  assert.throws(() => parseWhisperOjf("not json{"), (e: unknown) =>
+    e instanceof ToolError && e.code === "TRANSCRIPTION_ENGINE_FAILED");
+  const doc = JSON.stringify({
+    transcription: [
+      { offsets: { from: 0, to: 500 }, text: "   ", tokens: [] },
+      { offsets: { from: 500, to: 900 }, text: " hello", tokens: [{ text: " hello", offsets: { from: 510, to: 700 } }] },
+    ],
+  });
+  const { segments } = parseWhisperOjf(doc);
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0]!.text, "hello");
+  assert.equal(segments[0]!.words!.length, 1);
+});
+
+// fake NATIVE engine: reports transcribeSegments; proves the orchestrator
+// honors the capability (one whole-file invocation, no windows)
+function makeFakeNative(id: string, segs: { s: number; e: number; text: string; words: { s: number; e: number; t: string }[] }[]) {
+  let calls = 0;
+  const engine: TranscriptionEngine = {
+    id,
+    describe: `fake native engine ${id} (unit test only)`,
+    detect: async () => ({ available: true, detail: id }),
+    async transcribeWav() {
+      fail("TRANSCRIPTION_ENGINE_FAILED", "fake native engine must not be windowed");
+    },
+    async transcribeSegments(_wav, opts) {
+      calls++;
+      const words = opts.words === true;
+      return {
+        segments: segs.map((x) => ({
+          start: x.s,
+          end: x.e,
+          text: x.text,
+          ...(words ? { words: x.words.map((w) => ({ start: w.s, end: w.e, text: w.t })) } : {}),
+        })),
+        model: `${id}-model`,
+        ms: 5,
+        language: "en",
+      };
+    },
+  };
+  return {
+    engine,
+    calls: () => calls,
+    register: () => ENGINES.push(engine),
+    unregister: () => {
+      const i = ENGINES.indexOf(engine);
+      if (i >= 0) ENGINES.splice(i, 1);
+    },
+  };
+}
+
+const NATIVE_SEGS = [
+  { s: 0, e: 3.96, text: "Um, you know.", words: [{ s: 0.01, e: 0.27, t: "Um," }, { s: 0.4, e: 0.5, t: "you" }, { s: 0.5, e: 0.84, t: "know." }] },
+  { s: 4.32, e: 9.36, text: "So basically.", words: [{ s: 4.32, e: 4.33, t: "So" }, { s: 4.33, e: 5.4, t: "basically." }] },
+];
+
+test("transcribe: --word-timestamps + word-incapable engine -> OPERATION_INVALID (param guard)", async () => {
+  for (const id of ["handy", "fake-oop"]) {
+    // handy may not be installed — the guard fires before any detect/spawn
+    await assert.rejects(
+      transcribeInput(FIXTURE, { engine: id, wordTimestamps: true, noCache: true }),
+      (e: unknown) =>
+        e instanceof ToolError && e.code === "OPERATION_INVALID" && /word-capable/.test(e.message),
+    );
+  }
+});
+
+test("transcribe: native engine -> ONE whole-file invocation, words honored, chunk ignored", async () => {
+  const fake = makeFakeNative("fake-native", NATIVE_SEGS);
+  fake.register();
+  try {
+    const r = await transcribeInput(FIXTURE, {
+      engine: fake.engine.id,
+      wordTimestamps: true,
+      chunkSeconds: 5, // would be 6 windows if windowed
+      concurrency: 4, // no-op for native engines
+      noCache: true,
+    });
+    assert.equal(fake.calls(), 1); // no windowing, no parallel re-invocation
+    assert.equal(r.engine, "fake-native");
+    assert.equal(r.language, "en");
+    assert.equal(r.params?.wordTimestamps, true);
+    assert.deepEqual(
+      r.segments.map((s) => s.words!.map((w) => w.text)),
+      [["Um,", "you", "know."], ["So", "basically."]],
+    );
+    const plain = await transcribeInput(FIXTURE, { engine: fake.engine.id, noCache: true });
+    assert.equal(fake.calls(), 2); // still one invocation per run
+    assert.ok(plain.segments.every((s) => !("words" in s))); // segments WITHOUT words when not requested
+    assert.equal(plain.params?.wordTimestamps, false);
+    assert.equal(plain.params?.chunkSeconds, undefined); // native params carry no windowing facts
+  } finally {
+    fake.unregister();
+  }
+});
+
+test("transcribe: native cache key transcript-<engine>-<model>-c0-w<0|1>.json; words flag toggles miss", async () => {
+  const fake = makeFakeNative("fake-native-cache", NATIVE_SEGS);
+  fake.register();
+  try {
+    await transcribeInput(FIXTURE, { engine: fake.engine.id, wordTimestamps: true }); // miss -> write w1
+    const w1lines: string[] = [];
+    await transcribeInput(FIXTURE, {
+      engine: fake.engine.id,
+      wordTimestamps: true,
+      debug: (l) => w1lines.push(l),
+    });
+    assert.ok(
+      w1lines.some((l) => l.includes("cache hit: transcript-fake-native-cache-default-c0-w1.json")),
+      w1lines.join("; "),
+    );
+    const w0lines: string[] = [];
+    await transcribeInput(FIXTURE, {
+      engine: fake.engine.id, // no words flag -> DIFFERENT key, must MISS
+      debug: (l) => w0lines.push(l),
+    });
+    assert.ok(
+      w0lines.some((l) => l.includes("cache miss: wrote transcript-fake-native-cache-default-c0-w0.json")),
+      w0lines.join("; "),
+    );
+    // structural: native keys never collide with windowed entries (windowed
+    // keys are -c<chunk>.json with no -w suffix, from real chunk values)
+    const cache = new Cache();
+    const id = await cache.sourceId(FIXTURE);
+    const files = await readdir(path.join(".video-agent/cache", id));
+    assert.ok(files.includes("transcript-fake-native-cache-default-c0-w1.json"));
+    assert.ok(files.includes("transcript-fake-native-cache-default-c0-w0.json"));
+    assert.ok(files.every((f) => !f.startsWith("transcript-fake-native-cache") || /-c0-w[01]\.json$/.test(f)));
+  } finally {
+    fake.unregister();
+  }
+});
+
+test("transcribe: --word-timestamps with no engine selects whisper-cpp; unavailable -> TRANSCRIPTION_ENGINE_UNAVAILABLE", async () => {
+  // unit tmp cwd has no .video-agent/models -> the whisper-cpp engine is
+  // unavailable here no matter the binary; the failure must name it
+  await assert.rejects(
+    transcribeInput(FIXTURE, { wordTimestamps: true, noCache: true }),
+    (e: unknown) =>
+      e instanceof ToolError &&
+      e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
+      /whisper-cpp/.test(e.message),
+  );
+});
+
+test("whisper model resolution: R2 ordered table (explicit path > models-dir name > default > listing error)", async () => {
+  const modelsDir = path.join(".video-agent", "models");
+  await mkdir(modelsDir, { recursive: true });
+  try {
+    await writeFile(path.join(modelsDir, "aa.bin"), "");
+    await writeFile(path.join(modelsDir, "ggml-base.en.bin"), "");
+    await writeFile("explicit.bin", "");
+    await writeFile(path.join(modelsDir, "dup.bin"), "");
+    await writeFile("dup.bin", "");
+
+    // rule 1: explicit existing path wins verbatim (even over a models-dir name)
+    assert.equal(resolveWhisperModel("explicit.bin"), "explicit.bin");
+    assert.equal(resolveWhisperModel("dup.bin"), "dup.bin");
+    // rule 2: models-dir name
+    assert.equal(resolveWhisperModel("aa.bin"), path.join(modelsDir, "aa.bin"));
+    // rule 3: provisioned default
+    assert.equal(resolveWhisperModel(undefined), path.join(modelsDir, "ggml-base.en.bin"));
+    // rule 4: unresolvable -> null + machine-readable listing
+    assert.equal(resolveWhisperModel("missing.bin"), null);
+    assert.throws(
+      () => whisperModelUnavailable("missing.bin"),
+      (e: unknown) =>
+        e instanceof ToolError &&
+        e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
+        JSON.stringify((e as ToolError).details?.known) === JSON.stringify(["aa.bin", "dup.bin", "ggml-base.en.bin"]),
+    );
+  } finally {
+    await rm(modelsDir, { recursive: true, force: true });
+    await rm("explicit.bin", { force: true });
+    await rm("dup.bin", { force: true });
+  }
+  // absent models dir -> null + note says so
+  assert.equal(resolveWhisperModel(undefined), null);
+  assert.throws(
+    () => whisperModelUnavailable(),
+    (e: unknown) =>
+      e instanceof ToolError && e.code === "TRANSCRIPTION_ENGINE_UNAVAILABLE" &&
+      String((e as ToolError).details?.note).includes("not found"),
+  );
+});
+
+test("whisper detect(): binary+model facts in the detail (no models dir -> unavailable)", async () => {
+  const { whisperEngine } = await import("../analysis/transcribe/engines.js");
+  const d = await whisperEngine.detect();
+  const hasCli = (await findWhisperCli()) !== null;
+  assert.equal(d.available, false); // no default model in the unit tmp cwd
+  assert.ok(d.detail.includes("whisper-cli") || hasCli === false);
+  assert.ok(d.detail.includes("ggml-base.en.bin"));
 });
