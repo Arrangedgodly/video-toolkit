@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { formatSrtTime, formatSrt, transcriptToCues, mapCueThroughTimeline, mapCuesThroughTimeline } from "../captions/srt.js";
+import { formatVttTime, formatVtt, escapeVttText } from "../captions/vtt.js";
+import { resolveCaptionFormat } from "../captions/generate.js";
 import { scoreHighlights, DEFAULT_HIGHLIGHT_PARAMS } from "../analysis/highlights.js";
 import { EditPlan } from "../core/schemas.js";
 import { buildRenderCommand, escapeFilterPath } from "../media/ffmpeg.js";
+import { ToolError } from "../core/errors.js";
 
 // ---- srt
 
@@ -65,6 +68,78 @@ test("mapCues merges same-text fragments that rejoin at a boundary", () => {
     [{ start: 0, end: 10 }, { start: 10, end: 20 }],
   );
   assert.deepEqual(out, [{ start: 8, end: 12, text: "joined" }]);
+});
+
+// ---- vtt (WebVTT variant: same cue math, WebVTT serialization)
+
+test("formatVttTime pads and uses dot milliseconds", () => {
+  assert.equal(formatVttTime(0), "00:00:00.000");
+  assert.equal(formatVttTime(1.5), "00:00:01.500");
+  assert.equal(formatVttTime(3661.25), "01:01:01.250");
+  assert.ok(!formatVttTime(98765.4321).includes(","), "no SRT comma separator");
+});
+
+test("formatVtt emits a WEBVTT header and numbered blocks with dot timestamps", () => {
+  const vtt = formatVtt([{ start: 0, end: 2, text: "hello\nworld" }]);
+  assert.equal(vtt, "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\nhello world\n");
+});
+
+test("formatVtt with no cues is a bare valid header", () => {
+  assert.equal(formatVtt([]), "WEBVTT\n\n\n");
+});
+
+test("vtt escapes HTML-significant characters in cue text; srt stays raw", () => {
+  const cue = { start: 0, end: 1, text: "rock & roll <i>loud</i>" };
+  assert.equal(escapeVttText(cue.text), "rock &amp; roll &lt;i&gt;loud&lt;/i&gt;");
+  assert.equal(
+    formatVtt([cue]),
+    "WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.000\nrock &amp; roll &lt;i&gt;loud&lt;/i&gt;\n",
+  );
+  // SRT behavior unchanged: same cue, raw text, comma separator
+  assert.equal(formatSrt([cue]), "1\n00:00:00,000 --> 00:00:01,000\nrock & roll <i>loud</i>\n");
+});
+
+test("srt and vtt stay in lockstep through the same cue math (remap parity)", () => {
+  const cues = transcriptToCues({
+    segments: [
+      { start: 0, end: 5, text: "one" },
+      { start: 8, end: 32, text: "spans a cut" },
+      { start: 33, end: 33.1, text: "too short, drops" },
+      { start: 40, end: 45, text: "tail" },
+    ],
+  } as never);
+  const mapped = mapCuesThroughTimeline(cues, [{ start: 0, end: 10 }, { start: 30, end: 40 }]);
+  const srt = formatSrt(mapped);
+  const vtt = formatVtt(mapped);
+  const vttBlocks = vtt.trim().split("\n\n");
+  assert.equal(vttBlocks[0], "WEBVTT");
+  // every non-header block is byte-identical to the SRT block modulo the
+  // millisecond separator — same numbers, same order, same text
+  assert.deepEqual(vttBlocks.slice(1), srt.trim().split("\n\n").map((b) => b.replace(/,/g, ".")));
+});
+
+test("resolveCaptionFormat: extension detection, explicit override, defaults", () => {
+  assert.equal(resolveCaptionFormat(undefined, undefined), "srt"); // legacy default
+  assert.equal(resolveCaptionFormat(undefined, "vtt"), "vtt");
+  assert.equal(resolveCaptionFormat("out.srt", undefined), "srt");
+  assert.equal(resolveCaptionFormat("out.vtt", undefined), "vtt");
+  assert.equal(resolveCaptionFormat("out.VTT", undefined), "vtt"); // case-insensitive
+  assert.equal(resolveCaptionFormat("out.srt", "vtt"), "vtt"); // override wins
+  assert.equal(resolveCaptionFormat("out.txt", "srt"), "srt"); // override rescues unknown extension
+});
+
+test("resolveCaptionFormat: unknown extension without override -> OUTPUT_PATH_INVALID", () => {
+  assert.throws(
+    () => resolveCaptionFormat("out.txt", undefined),
+    (e: unknown) => e instanceof ToolError && e.code === "OUTPUT_PATH_INVALID",
+  );
+});
+
+test("resolveCaptionFormat: bad --format value -> OPERATION_INVALID", () => {
+  assert.throws(
+    () => resolveCaptionFormat(undefined, "foo"),
+    (e: unknown) => e instanceof ToolError && e.code === "OPERATION_INVALID",
+  );
 });
 
 // ---- highlights

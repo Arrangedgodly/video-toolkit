@@ -172,13 +172,14 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "video_captions",
-    description: "Transcript -> .srt; with a plan, cue times remap through the plan's cuts (splitting cues that span cuts).",
+    description: "Transcript -> .srt or .vtt (format from the output extension, or explicit format); with a plan, cue times remap through the plan's cuts (splitting cues that span cuts).",
     inputSchema: {
       type: "object",
       properties: {
         transcript: str,
         output: str,
         plan: str,
+        format: { type: "string", enum: ["srt", "vtt"] },
       },
       required: ["transcript"],
     },
@@ -317,6 +318,7 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       return generateCaptions(String(a.transcript), {
         output: a.output !== undefined ? String(a.output) : undefined,
         plan: a.plan !== undefined ? String(a.plan) : undefined,
+        format: a.format !== undefined ? String(a.format) : undefined,
       });
     case "video_extract_frames":
       return extractFrames(String(a.input), {

@@ -43,14 +43,15 @@ video transcribe <input>           timestamped transcript (Parakeet via Handy; w
                                    --engine/--model/--chunk, --concurrency N parallel windows)
 video detect-filler <t.json>       filler-word candidates from a transcript
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
-video captions <t.json>            transcript → .srt; --plan remaps cue times through cuts
+video captions <t.json>            transcript → .srt or .vtt; --plan remaps cue times
+                                   through cuts (--format srt|vtt to override)
 video extract-frame <input>        jpg stills at --at t1,t2 / --count N (--size W to downscale)
 video review-frames <input>        boundary-grouped review stills (--scenes s.json,
                                    --per-boundary N, --window s, --size W)
 video generate-proxy <input>       low-cost review copy (default 480w, CRF 28)
 ```
 
-**Captions**: burning is a plan operation — `{"type": "captions", "file": "subs.srt", "style": "FontSize=24"}` — rendered in the same single pass via libass. Cue times are interpreted against the **edited output timeline**, so source-timed transcripts go through `video captions transcript.json --plan plan.json`, which remaps cues through the compiled timeline (a cue spanning a cut splits; fragments under 0.3s drop).
+**Captions**: burning is a plan operation — `{"type": "captions", "file": "subs.srt", "style": "FontSize=24"}` — rendered in the same single pass via libass. Cue times are interpreted against the **edited output timeline**, so source-timed transcripts go through `video captions transcript.json --plan plan.json`, which remaps cues through the compiled timeline (a cue spanning a cut splits; fragments under 0.3s drop). Output is SRT (default) or WebVTT: the format follows the `-o` extension (`.srt`/`.vtt`), or pass `--format srt|vtt` explicitly; cue math is identical across formats, WebVTT just serializes with a `WEBVTT` header, `.`-separated milliseconds, and HTML-escaped cue text.
 
 **find-highlights** turns observations into deterministic proposals: each transcript segment is scored on speech rate, pause-before emphasis, keyword hits, and length band, with reasons attached — the agent makes the editorial call on what to keep.
 

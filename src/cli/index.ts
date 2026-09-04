@@ -41,8 +41,9 @@ analysis (timestamped observations; never render):
   detect-filler <transcript.json>  filler-word candidates [--words "um,uh,..."]
   find-highlights <input>    highlight proposals from --transcript t.json
                              [--keywords "a,b,c"] [--min-score 0.35] [--count 5]
-  captions <transcript.json>  transcript -> .srt [--plan p.json] remaps cue times
-                             through the plan's cuts
+  captions <transcript.json>  transcript -> .srt|.vtt [--plan p.json] remaps cue
+                             times through the plan's cuts; format from the -o
+                             extension or --format srt|vtt (override)
   extract-frame <input>      jpg stills [--at t1,t2] [--count N] [--size W]
   review-frames <input>      grouped stills around scene boundaries
                              --scenes scenes.json [--per-boundary N=4]
@@ -86,6 +87,7 @@ interface CliFlags {
   window?: number;
   width?: number;
   output?: string;
+  format?: string;
   cutsFrom?: string;
   fillerPadBefore?: number;
   fillerPadEnd?: number;
@@ -131,6 +133,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--window") f.window = Number(argv[++i]);
     else if (a === "--width") f.width = Number(argv[++i]);
     else if (a === "--output" || a === "-o") f.output = argv[++i];
+    else if (a === "--format") f.format = argv[++i];
     else if (a === "--cuts-from") f.cutsFrom = argv[++i];
     else if (a === "--filler-pad-before") f.fillerPadBefore = Number(argv[++i]);
     else if (a === "--filler-pad-end") f.fillerPadEnd = Number(argv[++i]);
@@ -367,7 +370,13 @@ async function main(): Promise<void> {
       if (!input) throw new ToolError("OBSERVATION_INVALID", "usage: video captions <transcript.json>");
       emit(
         f,
-        await generateCaptions(input, { plan: f.plan, output: f.output, noCache: f.noCache, debug: debugLine(f) }),
+        await generateCaptions(input, {
+          plan: f.plan,
+          output: f.output,
+          format: f.format,
+          noCache: f.noCache,
+          debug: debugLine(f),
+        }),
       );
       return;
     }

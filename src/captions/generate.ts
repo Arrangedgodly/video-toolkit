@@ -6,6 +6,9 @@ import { compileTimeline } from "../core/timeline.js";
 import { loadPlan } from "../validate/validate.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 import { formatSrt, mapCuesThroughTimeline, transcriptToCues } from "./srt.js";
+import { formatVtt } from "./vtt.js";
+
+export type CaptionFormat = "srt" | "vtt";
 
 export interface CaptionsResult {
   output: string;
@@ -15,14 +18,39 @@ export interface CaptionsResult {
 }
 
 /**
- * Generate an .srt from a transcript. Without --plan, cue times equal the
- * transcript's source times. With --plan, cues are remapped through the
- * plan's compiled timeline so they line up with the edited output — a cue
- * spanning a cut splits; fragments under 0.3s drop.
+ * Pure format selection: an explicit `--format srt|vtt` wins (and rescues any
+ * output extension); otherwise the `-o` extension decides (`.srt`/`.vtt`,
+ * case-insensitive; anything else is a machine-readable OUTPUT_PATH_INVALID);
+ * with no `-o` the default is srt.
+ */
+export function resolveCaptionFormat(output?: string, format?: string): CaptionFormat {
+  if (format !== undefined) {
+    if (format !== "srt" && format !== "vtt") {
+      fail("OPERATION_INVALID", `--format must be srt or vtt (got ${format})`, { format });
+    }
+    return format;
+  }
+  if (output !== undefined) {
+    const lower = output.toLowerCase();
+    if (lower.endsWith(".vtt")) return "vtt";
+    if (lower.endsWith(".srt")) return "srt";
+    fail("OUTPUT_PATH_INVALID", `captions output extension must be .srt or .vtt (or pass --format): ${output}`, {
+      output,
+    });
+  }
+  return "srt";
+}
+
+/**
+ * Generate an .srt (default) or .vtt from a transcript. Without --plan, cue
+ * times equal the transcript's source times. With --plan, cues are remapped
+ * through the plan's compiled timeline so they line up with the edited
+ * output — a cue spanning a cut splits; fragments under 0.3s drop. Cue math
+ * is identical for both formats; only the serialization differs.
  */
 export async function generateCaptions(
   transcriptPath: string,
-  opts: CacheOpts & { plan?: string; output?: string } = {},
+  opts: CacheOpts & { plan?: string; output?: string; format?: string } = {},
 ): Promise<CaptionsResult> {
   let doc: unknown;
   try {
@@ -52,8 +80,9 @@ export async function generateCaptions(
     remapped = true;
   }
 
+  const format = resolveCaptionFormat(opts.output, opts.format);
   const output =
-    opts.output ?? `${transcriptPath.replace(/\.[^.]+$/, "")}${remapped ? ".edited" : ""}.srt`;
-  await writeFile(output, formatSrt(cues), "utf8");
+    opts.output ?? `${transcriptPath.replace(/\.[^.]+$/, "")}${remapped ? ".edited" : ""}.${format}`;
+  await writeFile(output, format === "vtt" ? formatVtt(cues) : formatSrt(cues), "utf8");
   return { output: path.resolve(output), cues: cues.length, dropped, remapped };
 }
