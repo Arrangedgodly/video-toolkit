@@ -89,6 +89,30 @@ test("timeline + speed 2 + resize + volume renders in one pass", async () => {
   assert.ok(cmd.includes("scale=640:-2"), cmd);
 });
 
+test("speed 2x render emits no verify warning (comparison is speed-adjusted)", async () => {
+  // 12s whole-source at 2x: output must be ~6s = timeline/speed — a CORRECT
+  // render whose raw-timeline delta exceeds the 1.0s warning threshold, i.e.
+  // exactly the case that used to fire the spurious "differs from timeline"
+  // warning when the verify stage compared against the RAW timelineDuration
+  const p = await writePlan("t1verify.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+  ], "t1verify.mp4"));
+  const debugLines: string[] = [];
+  const r = await renderPlan(p, { debug: (line) => debugLines.push(line) });
+  assert.ok(Math.abs(r.outputDuration - 6) < 0.3, `duration ${r.outputDuration}`);
+  // load-bearing: the raw-timeline delta is beyond the threshold, so a revert
+  // to comparing against timelineDuration would re-emit the warning
+  assert.ok(
+    r.timelineDuration - r.outputDuration > 1.0,
+    `raw-timeline delta ${r.timelineDuration - r.outputDuration} must exceed the 1.0s threshold`,
+  );
+  assert.ok(
+    debugLines.every((l) => !l.includes("warning: output duration")),
+    `unexpected verify warning: ${debugLines.join(" | ")}`,
+  );
+});
+
 test("preview of a resize plan stays at the smaller width", async () => {
   const p = await writePlan("t2.json", plan([
     { type: "trim", start: 0, end: 6 },

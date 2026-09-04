@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { ToolError } from "../core/errors.js";
 import { runFFmpeg, buildTranscodeCommand, type EncoderId } from "../media/ffmpeg.js";
 import { cachedInspect, Cache, type CacheOpts } from "../cache/cache.js";
 import { diagnose } from "../hardware/diagnose.js";
@@ -32,7 +33,7 @@ export async function benchmarkInput(
   const debug = opts.debug ?? (() => {});
   const media = await cachedInspect(input, opts);
   if (!media.video) {
-    throw Object.assign(new Error("benchmark needs a video stream"), { code: "UNSUPPORTED_MEDIA" });
+    throw new ToolError("UNSUPPORTED_MEDIA", "benchmark needs a video stream");
   }
   const segmentSeconds = Math.max(1, Math.min(opts.seconds ?? 6, media.duration, 30));
 

@@ -194,9 +194,12 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
 
   const outInfo = await inspectFile(output);
   lap("verify");
-  if (Math.abs(outInfo.duration - report.timelineDuration) > 1.0) {
+  // compare against the speed-adjusted expectation (the same value the
+  // progress math and the mix bed's atrim bound use) — a correct sped-up
+  // render must not warn; only a genuinely wrong duration should
+  if (Math.abs(outInfo.duration - expectedDuration) > 1.0) {
     debug(
-      `warning: output duration ${outInfo.duration.toFixed(2)}s differs from timeline ${report.timelineDuration.toFixed(2)}s`,
+      `warning: output duration ${outInfo.duration.toFixed(2)}s differs from expected ${expectedDuration.toFixed(2)}s`,
     );
   }
 

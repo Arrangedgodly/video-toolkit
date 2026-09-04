@@ -15,6 +15,9 @@ import { validatePlan } from "../validate/validate.js";
 const SILENCE = "sil.mp4";
 // hard visual cuts at 3s (black->white) and 6s (white->red)
 const SCENES = "scenes.mp4";
+// audio-only: no video stream — the stream-less input on which the four
+// video-needing commands must surface UNSUPPORTED_MEDIA (not INTERNAL)
+const AUDIO = "audio-only.mp3";
 let dir = "";
 
 before(async () => {
@@ -39,6 +42,13 @@ before(async () => {
     "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p", SCENES,
   ]);
   assert.equal(sc.code, 0, sc.stderr);
+
+  const au = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+    "-c:a", "libmp3lame", AUDIO,
+  ]);
+  assert.equal(au.code, 0, au.stderr);
 });
 
 after(async () => {
@@ -392,4 +402,40 @@ test("review-frames rejects a malformed scenes file", async () => {
   const r = await runCliExpectError("review-frames", SCENES, "--scenes", "bad-scenes.json");
   assert.notEqual(r.code, 0);
   assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
+});
+
+// ---- stream-less input: the four video-needing commands must surface their
+// real machine-readable code (UNSUPPORTED_MEDIA) through the CLI's stderr
+// JSON — not INTERNAL (the plain-Error throws were invisible to the catch)
+
+function stderrErrorCode(stderr: string): string {
+  const payload = JSON.parse(stderr) as { error: { code: string } };
+  return payload.error.code;
+}
+
+test("extract-frame on audio-only -> UNSUPPORTED_MEDIA on stderr, exit 1", async () => {
+  const r = await runCliExpectError("extract-frame", AUDIO);
+  assert.equal(r.code, 1);
+  assert.equal(stderrErrorCode(r.stderr), "UNSUPPORTED_MEDIA");
+});
+
+test("generate-proxy on audio-only -> UNSUPPORTED_MEDIA on stderr, exit 1", async () => {
+  const r = await runCliExpectError("generate-proxy", AUDIO);
+  assert.equal(r.code, 1);
+  assert.equal(stderrErrorCode(r.stderr), "UNSUPPORTED_MEDIA");
+});
+
+test("review-frames on audio-only -> UNSUPPORTED_MEDIA on stderr, exit 1", async () => {
+  // a valid scenes report gets past the adapter's Zod gate first, so the
+  // failure provably comes from the worker's no-video-stream guard
+  await writeFile("one-scene.json", JSON.stringify({ boundaries: [{ timestamp: 1, confidence: 1 }] }));
+  const r = await runCliExpectError("review-frames", AUDIO, "--scenes", "one-scene.json");
+  assert.equal(r.code, 1);
+  assert.equal(stderrErrorCode(r.stderr), "UNSUPPORTED_MEDIA");
+});
+
+test("benchmark on audio-only -> UNSUPPORTED_MEDIA on stderr, exit 1", async () => {
+  const r = await runCliExpectError("benchmark", AUDIO);
+  assert.equal(r.code, 1);
+  assert.equal(stderrErrorCode(r.stderr), "UNSUPPORTED_MEDIA");
 });

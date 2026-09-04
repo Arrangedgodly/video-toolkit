@@ -78,7 +78,7 @@ export async function reviewFrames(
   const media = await cachedInspect(input, opts);
   const debug = opts.debug ?? (() => {});
   if (!media.video) {
-    throw Object.assign(new Error("review-frames needs a video stream"), { code: "UNSUPPORTED_MEDIA" });
+    throw new ToolError("UNSUPPORTED_MEDIA", "review-frames needs a video stream");
   }
 
   const params: ReviewFramesParams = {

@@ -1,5 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { ToolError } from "../core/errors.js";
 import { runFFmpeg } from "../media/ffmpeg.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 
@@ -37,7 +38,7 @@ export async function extractFrames(
   const media = await cachedInspect(input, opts);
   const debug = opts.debug ?? (() => {});
   if (!media.video) {
-    throw Object.assign(new Error("extract-frame needs a video stream"), { code: "UNSUPPORTED_MEDIA" });
+    throw new ToolError("UNSUPPORTED_MEDIA", "extract-frame needs a video stream");
   }
 
   const times =

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { ToolError } from "../core/errors.js";
 import { runFFmpeg } from "../media/ffmpeg.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 
@@ -18,7 +19,7 @@ export async function generateProxy(
 ): Promise<ProxyResult> {
   const media = await cachedInspect(input, opts);
   if (!media.video) {
-    throw Object.assign(new Error("generate-proxy needs a video stream"), { code: "UNSUPPORTED_MEDIA" });
+    throw new ToolError("UNSUPPORTED_MEDIA", "generate-proxy needs a video stream");
   }
   const width = opts.width ?? 480;
   const stem = path.basename(input).replace(/\.[^.]+$/, "");
