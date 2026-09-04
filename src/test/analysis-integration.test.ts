@@ -341,3 +341,55 @@ test("plan --cuts-from rejects a report that is neither silence nor filler", asy
   assert.notEqual(r.code, 0);
   assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
 });
+
+test("review-frames extracts grouped, downscaled stills around real scene boundaries", async () => {
+  const report = await detectScenes(SCENES, { threshold: 0.3 }); // cached: cuts at ~3s/~6s
+  await writeFile("scenes.json", JSON.stringify(report));
+  const r = await runCli<{ dir: string; groups: { boundary: number; frames: string[] }[] }>(
+    "review-frames",
+    SCENES,
+    "--scenes",
+    "scenes.json",
+    "--per-boundary",
+    "3",
+    "--window",
+    "1",
+    "--size",
+    "160",
+    "--dir",
+    "review-out",
+  );
+  assert.equal(r.groups.length, 2, JSON.stringify(r.groups));
+  assert.ok(Math.abs(r.groups[0]!.boundary - 3) < 0.3, `boundary ${r.groups[0]!.boundary}`);
+  assert.ok(Math.abs(r.groups[1]!.boundary - 6) < 0.3, `boundary ${r.groups[1]!.boundary}`);
+  for (const g of r.groups) {
+    assert.equal(g.frames.length, 3);
+    for (const p of g.frames) {
+      const st = await stat(p);
+      assert.ok(st.size > 100, `${p} too small`); // solid-color 160px jpg ≈ 340 B
+      const info = await inspectFile(p); // jpg: one mjpeg video stream
+      assert.equal(info.video?.width, 160, `${p} not downscaled`);
+    }
+  }
+});
+
+test("review-frames with an empty scenes report returns empty groups with a note", async () => {
+  await writeFile("empty-scenes.json", JSON.stringify({ boundaries: [] }));
+  const r = await runCli<{ groups: unknown[]; note?: string }>(
+    "review-frames",
+    SCENES,
+    "--scenes",
+    "empty-scenes.json",
+    "--dir",
+    "review-empty",
+  );
+  assert.deepEqual(r.groups, []);
+  assert.equal(typeof r.note, "string");
+});
+
+test("review-frames rejects a malformed scenes file", async () => {
+  await writeFile("bad-scenes.json", JSON.stringify({ segments: [] })); // silence-shaped
+  const r = await runCliExpectError("review-frames", SCENES, "--scenes", "bad-scenes.json");
+  assert.notEqual(r.code, 0);
+  assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
+});

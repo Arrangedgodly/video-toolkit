@@ -10,12 +10,13 @@ import { benchmarkInput } from "../benchmark/benchmark.js";
 import { detectSilence } from "../analysis/silence.js";
 import { detectScenes } from "../analysis/scenes.js";
 import { extractFrames } from "../analysis/frames.js";
+import { reviewFrames } from "../analysis/review-frames.js";
 import { generateProxy } from "../analysis/proxy.js";
 import { transcribeInput } from "../analysis/transcribe/index.js";
 import { detectFillerInstances, DEFAULT_FILLER_PHRASES } from "../analysis/filler.js";
 import { scoreHighlights, DEFAULT_HIGHLIGHT_PARAMS } from "../analysis/highlights.js";
 import { generateCaptions } from "../captions/generate.js";
-import { SilenceReport, TranscriptReport } from "../core/schemas.js";
+import { SceneReport, SilenceReport, TranscriptReport } from "../core/schemas.js";
 import { readFile } from "node:fs/promises";
 import { ToolError } from "../core/errors.js";
 
@@ -106,6 +107,23 @@ const TOOLS: ToolDef[] = [
       type: "object",
       properties: { input: str, threshold: { type: "number" } },
       required: ["input"],
+    },
+  },
+  {
+    name: "video_review_frames",
+    description:
+      "Grouped jpg stills around every boundary of a scenes report (per-boundary evenly spaced stills in a ±window/2 span, downscaled) for agent visual review; fresh on demand, no cache.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        input: str,
+        scenes: str,
+        per_boundary: { type: "number" },
+        window: { type: "number" },
+        size: { type: "number" },
+        dir: str,
+      },
+      required: ["input", "scenes"],
     },
   },
   {
@@ -232,6 +250,26 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       });
     case "video_detect_scenes":
       return detectScenes(String(a.input), { threshold: (a.threshold as number | undefined) ?? 0.4 });
+    case "video_review_frames": {
+      let doc: unknown;
+      try {
+        doc = JSON.parse(await readFile(String(a.scenes), "utf8"));
+      } catch {
+        throw new ToolError("OBSERVATION_INVALID", `scenes file is missing or not valid JSON: ${a.scenes}`);
+      }
+      const parsed = SceneReport.safeParse(doc);
+      if (!parsed.success) {
+        throw new ToolError("OBSERVATION_INVALID", "file is not a valid scene report", {
+          file: String(a.scenes),
+        });
+      }
+      return reviewFrames(String(a.input), parsed.data, {
+        perBoundary: a.per_boundary as number | undefined,
+        window: a.window as number | undefined,
+        size: a.size as number | undefined,
+        dir: a.dir !== undefined ? String(a.dir) : undefined,
+      });
+    }
     case "video_transcribe":
       return transcribeInput(String(a.input), {
         engine: a.engine !== undefined ? String(a.engine) : undefined,

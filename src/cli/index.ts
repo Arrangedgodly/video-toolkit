@@ -10,12 +10,13 @@ import { benchmarkInput } from "../benchmark/benchmark.js";
 import { detectSilence } from "../analysis/silence.js";
 import { detectScenes } from "../analysis/scenes.js";
 import { extractFrames } from "../analysis/frames.js";
+import { reviewFrames } from "../analysis/review-frames.js";
 import { generateProxy } from "../analysis/proxy.js";
 import { transcribeInput } from "../analysis/transcribe/index.js";
 import { detectFillerInstances, DEFAULT_FILLER_PHRASES } from "../analysis/filler.js";
 import { scoreHighlights, DEFAULT_HIGHLIGHT_PARAMS } from "../analysis/highlights.js";
 import { generateCaptions } from "../captions/generate.js";
-import { SilenceReport, TranscriptReport } from "../core/schemas.js";
+import { SceneReport, SilenceReport, TranscriptReport } from "../core/schemas.js";
 
 const USAGE = `video — agent-native video editing toolkit
 
@@ -41,6 +42,9 @@ analysis (timestamped observations; never render):
   captions <transcript.json>  transcript -> .srt [--plan p.json] remaps cue times
                              through the plan's cuts
   extract-frame <input>      jpg stills [--at t1,t2] [--count N] [--size W]
+  review-frames <input>      grouped stills around scene boundaries
+                             --scenes scenes.json [--per-boundary N=4]
+                             [--window s=1.5] [--size W=480] [--dir D]
   generate-proxy <input>     low-cost review copy [--width W] [--output F]
 
 agent adapter:
@@ -75,6 +79,9 @@ interface CliFlags {
   count?: number;
   size?: number;
   dir?: string;
+  scenes?: string;
+  perBoundary?: number;
+  window?: number;
   width?: number;
   output?: string;
   cutsFrom?: string;
@@ -116,6 +123,9 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--count") f.count = Number(argv[++i]);
     else if (a === "--size") f.size = Number(argv[++i]);
     else if (a === "--dir") f.dir = argv[++i];
+    else if (a === "--scenes") f.scenes = argv[++i];
+    else if (a === "--per-boundary") f.perBoundary = Number(argv[++i]);
+    else if (a === "--window") f.window = Number(argv[++i]);
     else if (a === "--width") f.width = Number(argv[++i]);
     else if (a === "--output" || a === "-o") f.output = argv[++i];
     else if (a === "--cuts-from") f.cutsFrom = argv[++i];
@@ -258,6 +268,34 @@ async function main(): Promise<void> {
         await extractFrames(input, {
           at: at && at.length > 0 ? at : undefined,
           count: f.count,
+          size: f.size,
+          dir: f.dir,
+          noCache: f.noCache,
+          debug: debugLine(f),
+        }),
+      );
+      return;
+    }
+    case "review-frames": {
+      if (!input) throw new ToolError("SOURCE_NOT_FOUND", "usage: video review-frames <input>");
+      if (!f.scenes) {
+        throw new ToolError("OBSERVATION_INVALID", "review-frames needs --scenes <scenes.json>");
+      }
+      let doc: unknown;
+      try {
+        doc = JSON.parse(await (await import("node:fs/promises")).readFile(f.scenes, "utf8"));
+      } catch {
+        throw new ToolError("OBSERVATION_INVALID", `scenes file is missing or not valid JSON: ${f.scenes}`);
+      }
+      const parsed = SceneReport.safeParse(doc);
+      if (!parsed.success) {
+        throw new ToolError("OBSERVATION_INVALID", "file is not a valid scene report", { file: f.scenes });
+      }
+      emit(
+        f,
+        await reviewFrames(input, parsed.data, {
+          perBoundary: f.perBoundary,
+          window: f.window,
           size: f.size,
           dir: f.dir,
           noCache: f.noCache,

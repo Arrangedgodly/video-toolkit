@@ -5,6 +5,7 @@ import { parseSceneOutput } from "../analysis/scenes.js";
 import { silenceToCuts } from "../analysis/silence-to-cuts.js";
 import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
 import { fillerToCuts } from "../analysis/filler-to-cuts.js";
+import { planReviewGroups } from "../analysis/review-frames.js";
 
 test("parseSilenceOutput pairs starts with ends in order", () => {
   const stderr = [
@@ -263,4 +264,71 @@ test("fillerToCuts is deterministic for identical input", () => {
     fillerToCuts(report, 30, { padBefore: 0.1, padEnd: 0.25 }),
     fillerToCuts(report, 30, { padBefore: 0.1, padEnd: 0.25 }),
   );
+});
+
+const sceneReport = (ts: number[]) => ({
+  boundaries: ts.map((t) => ({ timestamp: t, confidence: 0.5 })),
+});
+
+test("planReviewGroups spaces per-boundary stills at interval midpoints", () => {
+  const { groups, note } = planReviewGroups(sceneReport([10]), 30, { perBoundary: 4, window: 2 });
+  assert.equal(note, undefined);
+  assert.deepEqual(groups, [{ boundary: 10, times: [9.25, 9.75, 10.25, 10.75] }]);
+});
+
+test("per-boundary 1 lands exactly on the boundary", () => {
+  const { groups } = planReviewGroups(sceneReport([5.5]), 30, { perBoundary: 1, window: 3 });
+  assert.deepEqual(groups, [{ boundary: 5.5, times: [5.5] }]);
+});
+
+test("planReviewGroups clamps the window at 0", () => {
+  const { groups } = planReviewGroups(sceneReport([0]), 8, { perBoundary: 4, window: 2 });
+  assert.deepEqual(groups, [{ boundary: 0, times: [0.125, 0.375, 0.625, 0.875] }]);
+});
+
+test("planReviewGroups clamps the window at source duration", () => {
+  const atEnd = planReviewGroups(sceneReport([8]), 8, { perBoundary: 4, window: 2 });
+  assert.deepEqual(atEnd.groups, [{ boundary: 8, times: [7.125, 7.375, 7.625, 7.875] }]);
+  const nearEnd = planReviewGroups(sceneReport([7.8]), 8, { perBoundary: 2, window: 1.6 });
+  assert.deepEqual(nearEnd.groups, [{ boundary: 7.8, times: [7.25, 7.75] }]);
+});
+
+test("planReviewGroups rounds boundary and times to 3 decimals", () => {
+  const { groups } = planReviewGroups(sceneReport([10.0009]), 30, { perBoundary: 4, window: 2 });
+  assert.deepEqual(groups, [
+    { boundary: 10.001, times: [9.251, 9.751, 10.251, 10.751] },
+  ]);
+});
+
+test("an empty scenes report yields empty groups with a note, not an error", () => {
+  assert.deepEqual(planReviewGroups({ boundaries: [] }, 30, { perBoundary: 4, window: 1.5 }), {
+    groups: [],
+    note: "no scene boundaries in report",
+  });
+});
+
+test("boundaries fully outside the source drop; a boundary at duration keeps", () => {
+  const { groups, note } = planReviewGroups(sceneReport([31, 30]), 30, { perBoundary: 2, window: 1.5 });
+  assert.equal(note, undefined);
+  assert.deepEqual(groups, [{ boundary: 30, times: [29.438, 29.813] }]);
+  const allOutside = planReviewGroups(sceneReport([31]), 30, { perBoundary: 4, window: 1.5 });
+  assert.deepEqual(allOutside, { groups: [], note: "all boundaries outside the source duration" });
+});
+
+test("planReviewGroups preserves the report's boundary order", () => {
+  const { groups } = planReviewGroups(sceneReport([6, 3]), 9, { perBoundary: 2, window: 1 });
+  assert.deepEqual(groups.map((g) => g.boundary), [6, 3]);
+});
+
+test("planReviewGroups rejects invalid parameters with OPERATION_INVALID", () => {
+  for (const params of [
+    { perBoundary: 0, window: 1.5 },
+    { perBoundary: 2.5, window: 1.5 },
+    { perBoundary: 4, window: 0 },
+  ]) {
+    assert.throws(
+      () => planReviewGroups(sceneReport([10]), 30, params),
+      (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+    );
+  }
 });

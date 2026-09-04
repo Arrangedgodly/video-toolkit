@@ -44,6 +44,8 @@ video detect-filler <t.json>       filler-word candidates from a transcript
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
 video captions <t.json>            transcript → .srt; --plan remaps cue times through cuts
 video extract-frame <input>        jpg stills at --at t1,t2 / --count N (--size W to downscale)
+video review-frames <input>        boundary-grouped review stills (--scenes s.json,
+                                   --per-boundary N, --window s, --size W)
 video generate-proxy <input>       low-cost review copy (default 480w, CRF 28)
 ```
 
@@ -110,7 +112,7 @@ Codes: `PLAN_INVALID_JSON`, `PLAN_SCHEMA_INVALID`, `SOURCE_NOT_FOUND`, `TIMESTAM
 
 ## MCP server
 
-The same engine is exposed as an MCP stdio server — every command becomes a `video_*` tool (`video_inspect`, `video_plan`, `video_validate`, `video_preview`, `video_render`, `video_detect_silence`, `video_detect_scenes`, `video_extract_frames`, `video_generate_proxy`, `video_diagnose`, `video_benchmark`). The server is a thin adapter over the engine functions the CLI uses; the engine has no knowledge of MCP or any AI provider.
+The same engine is exposed as an MCP stdio server — every command becomes a `video_*` tool (`video_inspect`, `video_plan`, `video_validate`, `video_preview`, `video_render`, `video_detect_silence`, `video_detect_scenes`, `video_review_frames`, `video_extract_frames`, `video_generate_proxy`, `video_diagnose`, `video_benchmark`). The server is a thin adapter over the engine functions the CLI uses; the engine has no knowledge of MCP or any AI provider.
 
 ```sh
 video mcp        # or: video-mcp
@@ -154,7 +156,7 @@ FFmpeg command construction lives in exactly one module; the CLI never sees a co
 ## How an agent should consume this
 
 1. `video inspect <input>` for facts — never parse ffprobe yourself.
-2. Observe: run the analyses the task needs (`detect-silence`, `detect-scenes`); use `extract-frame` to actually look at moments, `generate-proxy` for a review copy. Observations are cached — re-running is free.
+2. Observe: run the analyses the task needs (`detect-silence`, `detect-scenes`); use `extract-frame` to actually look at moments, `review-frames --scenes scenes.json` for grouped stills around every scene boundary (the review unit for scene judgments), `generate-proxy` for a review copy. Observations are cached — re-running is free.
 3. Decide: turn observations into editorial choices. `video plan <input> --cuts-from silence.json` pre-fills silence cuts deterministically; `video plan <input> --cuts-from filler.json` pre-fills filler cuts from a `detect-filler` report (verify the estimated times with `extract-frame --at` first); `video plan <input> --highlights-from highlights.json` scaffolds a best-moments compilation from a `find-highlights` report. Keep, drop, or tune the proposed ops by judgment.
 4. `video validate` until `valid: true`; branch on `code` to fix errors programmatically.
 5. `video preview` to check the edit visually; iterate on the plan.

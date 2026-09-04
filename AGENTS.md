@@ -36,6 +36,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | `find-highlights` | `<input>` | `--transcript <t.json> --keywords "a,b" --min-score <0.35> --count <5>` | HighlightReport | silence cache reused |
 | `captions` | `<transcript.json>` | `--plan <p.json> -o <out.srt>` | `{output, cues, dropped, remapped}` | none |
 | `extract-frame` | `<input>` | `--at t1,t2 \| --count n=6 --size w --dir d` | `{dir, frames[]}` (jpg paths) | metadata.json |
+| `review-frames` | `<input>` | `--scenes <scenes.json> --per-boundary <n=4> --window <s=1.5> --size <w=480> --dir d` | `{dir, groups:[{boundary, frames[]}]}` (jpg paths) — per-boundary stills evenly spaced (interval midpoints) in `[boundary − window/2, boundary + window/2]` clamped to `[0, duration]`, downscaled to `--size` width; boundaries fully outside the source drop; empty report → `groups:[]` + `note` (not an error); non-integer/`<1` `--per-boundary` or `≤0` `--window` → `OPERATION_INVALID`; unparsable scenes file → `OBSERVATION_INVALID` | none (fresh stills like generate-proxy; scenes caching stays in detect-scenes) |
 | `generate-proxy` | `<input>` | `--width 480 --output f` | `{proxy, width, duration, wallMs, command[]}` | none |
 | `mcp` | — | — | MCP stdio server (see ADAPTERS) | — |
 
@@ -47,6 +48,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 - **W4 strategy**: `diagnose` → `benchmark` → pass `--encoder` to render accordingly.
 - **W5 MCP**: `video mcp` (or bin `video-mcp`); tools = `video_<command_snake_case>`; results identical to CLI stdout; failures = `isError:true` + `{error:{code,message,details}}`.
 - **W6 highlight compilation**: `transcribe > transcript.json` → `find-highlights <input> --transcript transcript.json > highlights.json` → `plan <input> --highlights-from highlights.json > plan.json` (tune `--count`/`--min-score`/`--pad` = the editorial decisions) → prune trims by judgment → W1 tail. Deterministic bridge per GLOSSARY; the agent decides.
+- **W7 scene review**: `detect-scenes > scenes.json` → `review-frames <input> --scenes scenes.json > review.json` (tune `--per-boundary`/`--window` = the editorial decisions) → inspect the grouped jpgs → express judgments as `trim`/`cut` ops → W1 tail. Still groups, not a proxy, are the review unit.
 
 ## PLAN SCHEMA v1
 
