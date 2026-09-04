@@ -65,6 +65,14 @@ export interface DispatchOptions {
    * else answer 2025-06-18 (the revision the server targets). Stdio keeps
    * its historical behavior: echo whatever was sent, else 2024-11-05. */
   negotiateProtocolVersion?: boolean;
+  /** Raw engine progress events for the long tools (video_render /
+   * video_preview), forwarded verbatim from renderPlan's existing onProgress
+   * hook (fed by the ffmpeg progress parse). Only a streaming transport
+   * passes one; stdio never does, so its stdout stays byte-identical —
+   * notifications surface ONLY through this callback and the return contract
+   * below is unchanged. Throttling + monotonicity are transport policy
+   * (R6: the sink lives in src/agent/mcp-http.ts). */
+  onProgress?: (p: { percent: number | null; timeSec: number }) => void;
 }
 
 interface ToolDef {
@@ -292,7 +300,11 @@ const TOOLS: ToolDef[] = [
   },
 ];
 
-async function callTool(name: string, a: Record<string, unknown>): Promise<unknown> {
+async function callTool(
+  name: string,
+  a: Record<string, unknown>,
+  onProgress?: DispatchOptions["onProgress"],
+): Promise<unknown> {
   switch (name) {
     case "video_inspect":
       return cachedInspect(String(a.input));
@@ -321,11 +333,14 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       };
     }
     case "video_preview":
-      return renderPlan(String(a.plan), { mode: "preview", force: a.force === true });
+      // progress sink threaded through (R6): raw events only — the transport
+      // owns throttle/monotonicity policy; absent (stdio) = no notifications
+      return renderPlan(String(a.plan), { mode: "preview", force: a.force === true, onProgress });
     case "video_render":
       return renderPlan(String(a.plan), {
         force: a.force === true,
         encoder: a.encoder as EncoderId | undefined,
+        onProgress,
       });
     case "video_render_batch":
       return renderBatch(
@@ -479,7 +494,7 @@ export async function handleMessage(
       const name = String(params?.name ?? "");
       const args = (params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = await callTool(name, args);
+        const result = await callTool(name, args, opts.onProgress);
         return respond(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
       } catch (e) {
         const payload =

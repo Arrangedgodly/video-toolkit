@@ -161,7 +161,7 @@ Tool results are the same compact JSON the CLI emits; failures arrive as `isErro
 
 ### Streamable HTTP
 
-`video mcp-serve [--port 8765] [--host 127.0.0.1] [--token <bearer>]` serves the same tools over MCP streamable HTTP: a single `/mcp` endpoint with plain-JSON replies (no SSE), optional sessions (a `Mcp-Session-Id` is issued at `initialize`; `DELETE` ends one), and transport failures as HTTP statuses — `405` on GET, `401` for a bad bearer token, `403` for a foreign `Origin`, `400` for bad JSON or an unsupported protocol-version header. `--token` is mandatory when `--host` is anything but loopback: the endpoint can run ffmpeg over arbitrary local files. HTTP client config:
+`video mcp-serve [--port 8765] [--host 127.0.0.1] [--token <bearer>]` serves the same tools over MCP streamable HTTP: a single `/mcp` endpoint with plain-JSON replies (plus opt-in SSE progress — below), optional sessions (a `Mcp-Session-Id` is issued at `initialize`; `DELETE` ends one), and transport failures as HTTP statuses — `405` on GET, `401` for a bad bearer token, `403` for a foreign `Origin`, `400` for bad JSON or an unsupported protocol-version header. `--token` is mandatory when `--host` is anything but loopback: the endpoint can run ffmpeg over arbitrary local files. HTTP client config:
 
 ```json
 {
@@ -176,7 +176,7 @@ Tool results are the same compact JSON the CLI emits; failures arrive as `isErro
 }
 ```
 
-Long renders need a generous client timeout — without SSE there is no progress push (the same blackout as stdio).
+Long renders can stream progress: send `_meta.progressToken` (a string or integer) on a `tools/call` and the reply becomes an SSE stream (`text/event-stream`) emitting `notifications/progress` — monotonic 0–100 with `total: 100`, the token echoed verbatim — while `video_render`/`video_preview` run, closing with the final result frame (throttled to at most one event per 250 ms and 1 progress point). The official SDK option `resetTimeoutOnProgress: true` turns each event into a request-timeout refresh, which is the practical fix for minute-long renders. Requests without a token (and the stdio transport) get no progress push — keep a generous `timeoutMs` there. Dropping the connection never cancels a render.
 
 ## Architecture
 

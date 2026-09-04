@@ -1,17 +1,26 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { runCapture } from "../media/ffprobe.js";
-import { isLoopbackHost } from "../agent/mcp-http.js";
+import { createProgressSink, isLoopbackHost } from "../agent/mcp-http.js";
 
 // T16 — MCP streamable-HTTP transport. Raw fetch (no HTTP client deps) against
 // a spawned `video mcp-serve` on an OS-assigned port, plus stdio byte-identity
 // regressions for the refactored dispatcher and the off-loopback token fence.
+// T20 — progress-over-SSE (R6's committed checklist): throttled strictly-
+// increasing notifications/progress on token-carrying tools/call, closed by
+// the plain-path-identical final response frame; every other shape unchanged.
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
+/** T20 SSE fixtures: 20 s 720p — a final render runs ≥ ~2 s wall here, long
+ * enough for several ffmpeg progress chunks (stats every ~0.5 s) to clear the
+ * 250 ms / 1.0-point dual gate, so ≥2 notifications are guaranteed, not racy. */
+const SSE_FIXTURE = "sse-src.mp4";
+const SSE_PLAN = "sse-plan.json"; // final render → sse-out.mp4 (+ .preview.mp4)
+const SSE_PLAN_B = "sse-plan-b.json"; // disconnect probe needs its own output
 const CLI = path.resolve(import.meta.dirname, "..", "cli", "index.js");
 const SERVER = path.resolve(import.meta.dirname, "..", "agent", "mcp-server.js");
 
@@ -149,6 +158,24 @@ before(async () => {
     "-c:a", "aac", FIXTURE,
   ]);
   assert.equal(r.code, 0, r.stderr);
+
+  const sr = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
+    "-f", "lavfi", "-i", "sine=frequency=440",
+    "-t", "20", "-c:v", "libx264", "-crf", "28", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", SSE_FIXTURE,
+  ]);
+  assert.equal(sr.code, 0, sr.stderr);
+  const plan = (out: string): string =>
+    JSON.stringify({
+      version: 1,
+      source: SSE_FIXTURE,
+      operations: [{ type: "trim", start: 0, end: 20 }],
+      output: { path: out, mode: "final" },
+    });
+  await writeFile(SSE_PLAN, plan("sse-out.mp4"));
+  await writeFile(SSE_PLAN_B, plan("sse-out-b.mp4"));
 
   const main = await startServe(["--port", "0"]); // OS-assigned ephemeral port
   serve = main.proc;
@@ -445,4 +472,340 @@ test("stdio: malformed JSON, notifications and unknown notifications stay silent
     1,
   );
   assert.deepEqual(lines, ['{"jsonrpc":"2.0","id":11,"result":{}}']); // exactly one line
+});
+
+// ---- T20: progress over SSE (R6's committed checklist) ----
+
+interface SseFrame {
+  event: string;
+  data: string;
+}
+
+/** parse the committed framing: every frame is `event: message\ndata: <one
+ * JSON-RPC object>` dispatched by a blank line; the stream ends with one. */
+function parseSse(body: string): SseFrame[] {
+  assert.ok(body.endsWith("\n\n"), `stream must end with a blank line: ${JSON.stringify(body.slice(-40))}`);
+  return body.slice(0, -2).split("\n\n").map((f) => {
+    const m = /^event: (.*)\ndata: (.*)$/.exec(f);
+    assert.ok(m, `frame not in event+data form: ${JSON.stringify(f)}`);
+    assert.equal(m[1], "message");
+    assert.ok(!m[2]!.includes("\n"), "data must be exactly one JSON line");
+    return { event: m[1]!, data: m[2]! };
+  });
+}
+
+interface ProgressParams {
+  progressToken: unknown;
+  progress: number;
+  total: number;
+  message: string;
+}
+
+test("sink: dual-gate throttle + strict monotonicity (fake clock, no real sleeps)", () => {
+  const frames: { params: ProgressParams }[] = [];
+  let clock = 0;
+  const sink = createProgressSink(42, (n) => frames.push(n as { params: ProgressParams }), () => clock);
+
+  sink({ percent: null, timeSec: 0.5 }); // null percent → never emitted
+  sink({ percent: 0.9, timeSec: 0.3 }); // <1.0 above the 0-domain start → suppressed
+  clock = 100;
+  sink({ percent: 2.0, timeSec: 0.4 }); // time gate open (first emit), Δ2.0 → EMIT
+  clock = 200;
+  sink({ percent: 50, timeSec: 10 }); // only 100 ms since emit → suppressed
+  clock = 350; // exactly 250 ms since emit — boundary passes (>=)
+  sink({ percent: 50, timeSec: 10 }); // EMIT (same percent, 250 ms elapsed)
+  clock = 400;
+  sink({ percent: 99, timeSec: 19.8 }); // 50 ms since emit → suppressed
+  clock = 700;
+  sink({ percent: 50.9, timeSec: 10.2 }); // time OK, Δ0.9 <1.0 → suppressed
+  sink({ percent: 49, timeSec: 9.9 }); // regression below lastSent → suppressed
+  sink({ percent: 51.0, timeSec: 10.2 }); // Δ exactly 1.0 — boundary → EMIT
+  clock = 1200;
+  sink({ percent: 100, timeSec: 20 }); // EMIT; lastSent tracks only emissions
+
+  assert.deepEqual(
+    frames.map((f) => f.params.progress),
+    [2.0, 50, 51.0, 100],
+  );
+  for (const f of frames) {
+    assert.equal(f.params.progressToken, 42); // integer echoed verbatim
+    assert.equal(f.params.total, 100);
+    assert.equal(typeof f.params.message, "string");
+  }
+});
+
+test("sink: token is echoed verbatim in JSON — string stays quoted, integer stays a number", () => {
+  const stringFrames: string[] = [];
+  createProgressSink("render-tok", (n) => stringFrames.push(JSON.stringify(n)), () => 0)({
+    percent: 5,
+    timeSec: 1,
+  });
+  assert.equal(stringFrames.length, 1);
+  assert.ok(stringFrames[0]!.includes('"progressToken":"render-tok"'));
+
+  const intFrames: string[] = [];
+  createProgressSink(7, (n) => intFrames.push(JSON.stringify(n)), () => 0)({ percent: 5, timeSec: 1 });
+  assert.ok(intFrames[0]!.includes('"progressToken":7')); // never stringified
+  assert.ok(!intFrames[0]!.includes('"progressToken":"7"'));
+});
+
+test("SSE: token-carrying tools/call video_render streams progress, closes with the plain-path result", async () => {
+  // plain path first: no token → plain JSON render, the comparison baseline
+  const plain = await post(serveBase, rpc("tools/call", { name: "video_render", arguments: { plan: SSE_PLAN } }));
+  assert.equal(plain.status, 200);
+  assert.ok(plain.headers.get("content-type")!.startsWith("application/json"));
+  assert.ok(plain.headers.get("content-length"));
+  const plainObj = (await jsonBody(plain)) as {
+    id: number;
+    result: { content: { text: string }[] };
+  };
+  const plainPayload = JSON.parse(plainObj.result.content[0]!.text) as Record<string, unknown>;
+
+  // streamed path: same plan (force: the plain render above owns the output)
+  const res = await post(
+    serveBase,
+    rpc("tools/call", {
+      name: "video_render",
+      arguments: { plan: SSE_PLAN, force: true },
+      _meta: { progressToken: "sse-render-token" },
+    }),
+  );
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("text/event-stream"));
+  assert.equal(res.headers.get("cache-control"), "no-cache");
+  assert.equal(res.headers.get("x-accel-buffering"), "no");
+  assert.equal(res.headers.get("connection"), "keep-alive");
+  assert.equal(res.headers.get("content-length"), null); // chunked, self-delimiting
+
+  const frames = parseSse(await res.text());
+  const progress = frames.slice(0, -1).map((f) => JSON.parse(f.data) as { method: string; params: ProgressParams });
+  const finalFrame = JSON.parse(frames[frames.length - 1]!.data) as {
+    id: number;
+    result: { content: { text: string }[] };
+  };
+
+  // ≥2 strictly-increasing progress notifications, token echoed, total 100
+  assert.ok(progress.length >= 2, `expected >=2 progress notifications, got ${progress.length}`);
+  let prev = -Infinity;
+  for (const n of progress) {
+    assert.equal(n.method, "notifications/progress");
+    assert.equal(n.params.progressToken, "sse-render-token"); // verbatim string
+    assert.equal(n.params.total, 100);
+    assert.ok(n.params.progress > prev, `progress must strictly increase: ${n.params.progress} after ${prev}`);
+    prev = n.params.progress;
+  }
+
+  // the last frame IS the response: same object the plain path returned
+  const ssePayload = JSON.parse(finalFrame.result.content[0]!.text) as Record<string, unknown>;
+  delete plainPayload.wallMs; // wall-clock differs by construction
+  delete ssePayload.wallMs;
+  assert.deepEqual(ssePayload, plainPayload); // output/mode/encoder/timeline/command/outputDuration identical
+  await stat(path.join(dir, "sse-out.mp4"));
+});
+
+test("SSE: integer progressToken echoed verbatim (unquoted) during a render", async () => {
+  const res = await post(
+    serveBase,
+    rpc("tools/call", {
+      name: "video_render",
+      arguments: { plan: SSE_PLAN, force: true },
+      _meta: { progressToken: 42 },
+    }),
+  );
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("text/event-stream"));
+  const frames = parseSse(await res.text());
+  assert.ok(frames.length >= 2, "response-only stream would have exactly 1 frame");
+  const progress = frames.slice(0, -1).map((f) => JSON.parse(f.data) as { params: ProgressParams });
+  assert.ok(progress.length >= 1);
+  for (const n of progress) {
+    assert.equal(n.params.progressToken, 42); // number, never "42"
+    assert.equal(typeof n.params.progressToken, "number");
+  }
+  assert.ok(frames.some((f) => f.data.includes('"progressToken":42')), "raw JSON must carry the unquoted integer");
+  const finalFrame = JSON.parse(frames[frames.length - 1]!.data) as { result: { content: { text: string }[] } };
+  const payload = JSON.parse(finalFrame.result.content[0]!.text) as { mode: string; output: string };
+  assert.equal(payload.mode, "final");
+});
+
+test("SSE: non-progress tool with a token → response-only stream, frame byte-identical to the plain body", async () => {
+  const sse = await post(
+    serveBase,
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 31337,
+      method: "tools/call",
+      params: { name: "video_inspect", arguments: { input: FIXTURE }, _meta: { progressToken: "tok" } },
+    }),
+  );
+  assert.equal(sse.status, 200);
+  assert.ok(sse.headers.get("content-type")!.startsWith("text/event-stream"));
+  const frames = parseSse(await sse.text());
+  assert.equal(frames.length, 1, "inspect has no progress wiring — exactly the response frame");
+
+  const plain = await post(
+    serveBase,
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 31337,
+      method: "tools/call",
+      params: { name: "video_inspect", arguments: { input: FIXTURE } },
+    }),
+  );
+  const plainBody = await plain.text();
+  assert.equal(frames[0]!.data, plainBody); // byte-identical, id included
+});
+
+test("SSE: tool failure with a token → the isError result as the single final frame (error paths change NOT at all)", async () => {
+  const req = (withToken: boolean): string =>
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 777,
+      method: "tools/call",
+      params: {
+        name: "video_nonsense",
+        arguments: {},
+        ...(withToken ? { _meta: { progressToken: 1 } } : {}),
+      },
+    });
+  const sse = await post(serveBase, req(true));
+  assert.ok(sse.headers.get("content-type")!.startsWith("text/event-stream"));
+  const frames = parseSse(await sse.text());
+  assert.equal(frames.length, 1);
+  const plain = await post(serveBase, req(false));
+  assert.equal(frames[0]!.data, await plain.text()); // identical bytes
+  const parsed = JSON.parse(frames[0]!.data) as { result: { isError: boolean; content: { text: string }[] } };
+  assert.equal(parsed.result.isError, true);
+});
+
+test("degradation: no-token tools/call stays plain application/json (regression lock)", async () => {
+  const res = await post(serveBase, rpc("tools/call", { name: "video_inspect", arguments: { input: FIXTURE } }));
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("application/json"));
+  assert.ok(res.headers.get("content-length"));
+  const result = (await jsonBody(res)).result as { isError?: boolean };
+  assert.notEqual(result.isError, true);
+});
+
+test("degradation: non-conforming progressToken (float/object) is treated as absent → plain JSON", async () => {
+  for (const bad of [1.5, { id: "x" }]) {
+    const res = await post(
+      serveBase,
+      rpc("tools/call", {
+        name: "video_inspect",
+        arguments: { input: FIXTURE },
+        _meta: { progressToken: bad },
+      }),
+    );
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get("content-type")!.startsWith("application/json"), `token ${JSON.stringify(bad)}`);
+  }
+});
+
+test("degradation: tools/list WITH a progressToken stays plain JSON (non-tools/call never streams)", async () => {
+  const res = await post(serveBase, rpc("tools/list", { _meta: { progressToken: "nope" } }));
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("application/json"));
+  const tools = ((await jsonBody(res)).result as { tools: unknown[] }).tools;
+  assert.equal(tools.length, TOOLS.length);
+});
+
+test("degradation: notifications/cancelled → 202, accepted and ignored (renders are never cancelled)", async () => {
+  const res = await post(
+    serveBase,
+    rpc("notifications/cancelled", { requestId: 999, reason: "test" }, true),
+  );
+  assert.equal(res.status, 202);
+  assert.equal(await res.text(), "");
+});
+
+test("gates precede the stream: token-carrying tools/call with a foreign Origin → 403, no stream", async () => {
+  const res = await post(
+    serveBase,
+    rpc("tools/call", {
+      name: "video_render",
+      arguments: { plan: SSE_PLAN, force: true },
+      _meta: { progressToken: "t" },
+    }),
+    { Origin: "http://evil.example" },
+  );
+  assert.equal(res.status, 403);
+  assert.ok(res.headers.get("content-type")!.startsWith("application/json"));
+  const body = await jsonBody(res);
+  assert.equal((body.error as { code: number }).code, -32600);
+});
+
+test("disconnect mid-stream: the render still finishes and the server stays healthy (disconnect ≠ cancellation)", async () => {
+  const ac = new AbortController();
+  const res = await fetch(`${serveBase}/mcp`, {
+    method: "POST",
+    body: rpc("tools/call", {
+      name: "video_preview",
+      arguments: { plan: SSE_PLAN_B },
+      _meta: { progressToken: 9 },
+    }),
+    headers: { "Content-Type": "application/json" },
+    signal: ac.signal,
+  });
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("text/event-stream"));
+  ac.abort(); // hang up mid-render
+  await res.text().catch(() => {}); // aborted read — expected
+
+  // the render FINISHES (guard discards the response; nothing is cancelled)
+  const out = path.join(dir, "sse-out-b.preview.mp4");
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    try {
+      await stat(out);
+      break;
+    } catch {
+      assert.ok(Date.now() < deadline, "render did not finish after client disconnect");
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  const follow = await post(serveBase, rpc("tools/list"));
+  assert.equal(follow.status, 200);
+});
+
+test("stream-then-plain on the pooled connection: chunked framing is self-delimiting", async () => {
+  const sse = await post(
+    serveBase,
+    rpc("tools/call", {
+      name: "video_inspect",
+      arguments: { input: FIXTURE },
+      _meta: { progressToken: "reuse" },
+    }),
+  );
+  const frames = parseSse(await sse.text());
+  assert.equal(frames.length, 1);
+  // immediately reuse the same origin (undici pools the connection)
+  const plain = await post(serveBase, rpc("tools/list"));
+  assert.equal(plain.status, 200);
+  assert.ok(plain.headers.get("content-type")!.startsWith("application/json"));
+  const tools = ((await jsonBody(plain)).result as { tools: unknown[] }).tools;
+  assert.equal(tools.length, TOOLS.length);
+});
+
+test("stdio: a token-carrying tools/call emits exactly one response line — never a notification", async () => {
+  const lines = await stdioExchange(
+    [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: {
+          name: "video_inspect",
+          arguments: { input: FIXTURE },
+          _meta: { progressToken: "stdio-tok" },
+        },
+      }),
+    ],
+    1,
+  );
+  assert.equal(lines.length, 1); // stdout stays byte-identical protocol output
+  assert.ok(!lines[0]!.includes("notifications/progress"));
+  const parsed = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
+  assert.equal(parsed.id, 21);
+  JSON.parse(parsed.result.content[0]!.text);
 });

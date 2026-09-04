@@ -1,15 +1,25 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { handleMessage, KNOWN_PROTOCOL_VERSIONS, type McpMessage } from "./mcp-server.js";
+import {
+  handleMessage,
+  KNOWN_PROTOCOL_VERSIONS,
+  type JsonRpcResponse,
+  type McpMessage,
+} from "./mcp-server.js";
 
 /**
  * MCP streamable-HTTP adapter (spec revisions 2025-06-18/2025-11-25 — the
  * initialize era every deployed client speaks; 2026-era clients fall back to
  * initialize on our 400, per the spec's Backward Compatibility section).
- * Minimal contract from docs/ultron/research/r4-mcp-streamable-http.md:
- * ONE node:http server, a single /mcp path, plain-JSON replies (no SSE — this
- * server never pushes), sessions issued at initialize but never required.
- * Same dispatcher as the stdio transport (handleMessage); no tool logic here.
+ * Minimal contract from docs/ultron/research/r4-mcp-streamable-http.md plus
+ * the R6 progress extension (docs/ultron/research/r6-mcp-progress-sse.md):
+ * ONE node:http server, a single /mcp path, plain-JSON replies — EXCEPT a
+ * `tools/call` carrying `_meta.progressToken`, which opts into an SSE reply
+ * streaming `notifications/progress` and closing with the final response
+ * frame (byte-identical to the plain path). This server still never pushes
+ * unsolicited: no GET stream, no keep-alive channel. Sessions issued at
+ * initialize but never required. Same dispatcher as the stdio transport
+ * (handleMessage); no tool logic here.
  */
 
 export interface HttpServeOptions {
@@ -29,6 +39,116 @@ const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
 export function isLoopbackHost(host: string): boolean {
   const h = host.trim().toLowerCase();
   return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+// ---- R6 progress-over-SSE (docs/ultron/research/r6-mcp-progress-sse.md) ----
+
+/** Throttle item 5 (committed): emit only when ≥250 ms AND ≥1.0 progress-point
+ * have passed — bounds both rate (≤4/s) and total count (≤100 events per
+ * render: each must advance ≥1 point of a 0–100 domain, regardless of length). */
+export const PROGRESS_MIN_INTERVAL_MS = 250;
+export const PROGRESS_MIN_DELTA = 1.0;
+
+/**
+ * Throttled, strictly-increasing progress sink for one streamed request (R6
+ * checklist items 4–5). Receives RAW engine events (percent may be null,
+ * regress, or jump — the ffmpeg parse is not monotonic) and emits a
+ * `notifications/progress` object only when BOTH gates pass:
+ * `now - lastEmitMs >= 250` AND `percent - lastSent >= 1.0`. `lastSent`
+ * updates only on emission, so the emitted `progress` sequence is strictly
+ * increasing; `percent === null` is skipped (no total known at the engine
+ * level). The token is echoed VERBATIM — string stays a string, integer stays
+ * a number (the SDK keys its handlers on the raw value). No synthetic final
+ * 100% event: the response frame IS completion ("MUST stop after completion").
+ * `now` is injectable so tests drive the throttle with a fake clock — no real
+ * sleeps. Stateless per request; dead once the transport stops writing.
+ */
+export function createProgressSink(
+  token: string | number,
+  write: (obj: unknown) => void,
+  now: () => number = Date.now,
+): (p: { percent: number | null; timeSec: number }) => void {
+  let lastEmitMs = -Infinity; // first eligible event emits immediately
+  let lastSent = 0; // the 0–100 domain starts at 0
+  return (p) => {
+    if (p.percent === null || !Number.isFinite(p.percent)) return;
+    const nowMs = now();
+    if (nowMs - lastEmitMs < PROGRESS_MIN_INTERVAL_MS) return;
+    if (p.percent - lastSent < PROGRESS_MIN_DELTA) return;
+    lastEmitMs = nowMs;
+    lastSent = p.percent;
+    write({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: {
+        progressToken: token,
+        progress: p.percent,
+        total: 100,
+        message: `rendering ${p.timeSec.toFixed(1)}s`,
+      },
+    });
+  };
+}
+
+/**
+ * The SSE reply for one token-carrying `tools/call` (R6 checklist items 2–7).
+ * Runs after EVERY R4 gate has passed (a streamed call has passed every gate a
+ * plain call would). Head goes out BEFORE the tool runs (do not hold headers
+ * while ffmpeg spawns); every frame is `event: message\ndata: <one JSON-RPC
+ * object>\n\n`; the final frame is the exact object handleMessage returns —
+ * byte-identical to the plain path's body (same JSON.stringify, same
+ * isError-as-result semantics) — then `end()`. Exactly one response frame per
+ * stream, always, including every error path. All writes are guarded: a client
+ * disconnect mid-render stops emitting while the render FINISHES and the
+ * response is discarded — disconnect is NOT cancellation in the initialize era
+ * (neither is DELETE; `notifications/cancelled` rides the 202 branch, ignored).
+ */
+async function replySseCall(
+  message: McpMessage,
+  res: ServerResponse,
+  progressToken: string | number,
+): Promise<void> {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no", // 2026-era SHOULD; one line, forward-compat
+    // NO Content-Length — the reply is chunked and self-delimiting
+  });
+  res.flushHeaders();
+  const alive = (): boolean => !res.destroyed && !res.writableEnded;
+  const writeFrame = (obj: unknown): void => {
+    if (!alive()) return;
+    try {
+      res.write(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
+    } catch {
+      // client vanished mid-stream — swallow; the render keeps running
+    }
+  };
+  const onProgress = createProgressSink(progressToken, writeFrame);
+  let out: JsonRpcResponse | null;
+  try {
+    out = await handleMessage(message, { negotiateProtocolVersion: true, onProgress });
+  } catch (e) {
+    // item 6: never close without a response — the SDK would hang its
+    // pending promise until timeout
+    out = {
+      jsonrpc: "2.0",
+      id: message.id,
+      error: {
+        code: -32603,
+        message: `internal error: ${e instanceof Error ? e.message : String(e)}`,
+      },
+    };
+  }
+  if (out !== null) writeFrame(out);
+  if (alive()) {
+    try {
+      res.end(); // close AFTER the response frame, never before
+    } catch {
+      // already gone — nothing to close
+    }
+  }
 }
 
 export function startHttpServer(opts: HttpServeOptions = {}): Server {
@@ -142,9 +262,11 @@ export function startHttpServer(opts: HttpServeOptions = {}): Server {
     }
     const message = parsed as McpMessage & { result?: unknown; error?: unknown };
     // 9. dispatch — notifications (no id / null id) and client responses → 202;
-    //    requests → 200 + exactly one JSON-RPC object. JSON-RPC-level errors
-    //    (unknown method, tool failures as isError results) ride in 200 bodies
-    //    — HTTP 4xx stays reserved for transport-level failures.
+    //    requests → 200 + exactly one JSON-RPC object (plain JSON, or an SSE
+    //    stream for the token-carrying tools/call branch right below).
+    //    JSON-RPC-level errors (unknown method, tool failures as isError
+    //    results) ride in 200 bodies — HTTP 4xx stays reserved for
+    //    transport-level failures.
     const isNotification = message.id === undefined || message.id === null;
     const isResponse =
       message.method === undefined && (message.result !== undefined || message.error !== undefined);
@@ -152,6 +274,25 @@ export function startHttpServer(opts: HttpServeOptions = {}): Server {
       res.writeHead(202, { "Content-Length": 0 });
       res.end();
       return;
+    }
+    // 9b. R6: a `tools/call` carrying a CONFORMING `_meta.progressToken`
+    //     (string or integer — float/object/null/absent are treated as absent
+    //     ⇒ plain path) opts into the SSE reply. Placement: AFTER every R4
+    //     gate above (security is complete before any stream opens — a
+    //     streamed call has passed every gate a plain call would), BEFORE
+    //     handleMessage is awaited. No tool-name allowlist (the committed
+    //     rule): every token-carrying call streams; tools without progress
+    //     wiring (inspect, validate, …) simply emit a response-only stream.
+    if (message.method === "tools/call") {
+      const meta = message.params?._meta;
+      const rawToken =
+        typeof meta === "object" && meta !== null && !Array.isArray(meta)
+          ? (meta as Record<string, unknown>).progressToken
+          : undefined;
+      if (typeof rawToken === "string" || (typeof rawToken === "number" && Number.isInteger(rawToken))) {
+        await replySseCall(message, res, rawToken);
+        return;
+      }
     }
     const out = await handleMessage(message, { negotiateProtocolVersion: true });
     if (out === null) {
