@@ -47,6 +47,7 @@ video preview <plan>       cheap preview render (<output>.preview.mp4)
 video render <plan>        final render from the validated plan
 video diagnose             environment + ffmpeg capabilities (JSON)
 video benchmark <input>    measure fastest encoder/concurrency on this machine
+video transitions          crossfade kinds on this ffmpeg build (JSON)
 ```
 
 ### Analysis workers (timestamped observations; never render)
@@ -107,7 +108,7 @@ The plan declares **what to keep**, not a script: `trim` keeps a range, `cut` re
 }
 ```
 
-**Timeline ops** (`trim`, `cut`) select source ranges; multiple `trim`s union. **Transform ops** (`speed`, `resize`, `volume`, `normalize-audio`, `audio-mix`, `overlay-text`) apply to the whole output — at most one of each per plan — and compose into the same single pass (audio follows `speed` via an `atempo` chain; `volume` takes `db` or `factor`, exactly one). `audio-mix` layers a looping music bed under the program audio with speech-keyed sidechain ducking: `level` is bed gain in dB, and inside `duck` the `threshold` is **linear** amplitude (not dB) while `attack`/`release` are milliseconds. `overlay-text` burns a title card or lower third in the same pass — literal text with an optional `from`/`to` visibility window on the output timeline and a `position` (top/center/bottom); it uses a fixed system font (see AGENTS.md for the path and defaults). The **transition op** `crossfade` (at most one per plan, not combinable with `audio-mix`) joins the kept segments with fade transitions instead of hard cuts — still one FFmpeg pass; output duration shrinks by `(N−1)·duration`, the fade must be shorter than every kept segment (0.05 s floor; see AGENTS.md for the full rule table), and `video captions --plan` remaps cue times through the shrinkage so burned captions stay aligned.
+**Timeline ops** (`trim`, `cut`) select source ranges; multiple `trim`s union. **Transform ops** (`speed`, `resize`, `volume`, `normalize-audio`, `audio-mix`, `overlay-text`) apply to the whole output — at most one of each per plan — and compose into the same single pass (audio follows `speed` via an `atempo` chain; `volume` takes `db` or `factor`, exactly one). `audio-mix` layers a looping music bed under the program audio with speech-keyed sidechain ducking: `level` is bed gain in dB, and inside `duck` the `threshold` is **linear** amplitude (not dB) while `attack`/`release` are milliseconds. `overlay-text` burns a title card or lower third in the same pass — literal text with an optional `from`/`to` visibility window on the output timeline and a `position` (top/center/bottom); it uses a fixed system font (see AGENTS.md for the path and defaults). The **transition op** `crossfade` (at most one per plan, not combinable with `audio-mix`) joins the kept segments with fade transitions instead of hard cuts — still one FFmpeg pass; output duration shrinks by `(N−1)·duration`, the fade must be shorter than every kept segment (0.05 s floor; see AGENTS.md for the full rule table), and `video captions --plan` remaps cue times through the shrinkage so burned captions stay aligned. `video transitions` lists the transition kinds this FFmpeg build actually supports — parsed live from `ffmpeg -h filter=xfade` and cached per version, never a hand-maintained list — and is the menu for `crossfade.kind` (typical durations 0.2–1.0 s).
 
 Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operation type means one schema case plus one compiler/validator entry — the execution engine does not change. Timestamps are seconds, everywhere, in every layer.
 
@@ -158,7 +159,8 @@ agent/ (src/agent)               MCP stdio adapter — same engine functions
 core/schemas                     Zod: edit plan + observation schemas
 core/timeline                    ops → keep-segments (pure math, fully tested)
 validate/                        plan + media facts → ValidationReport
-media/ffmpeg                     command builder (argv arrays only) + runner
+media/ffmpeg · media/transitions command builder (argv arrays only) + runner;
+                                 live xfade transition catalog (environment query)
 render/                          preview/final settings, single-pass render
 analysis/                        workers: silence, scenes, transcribe, filler,
                                  highlights, frames, review-frames, proxy

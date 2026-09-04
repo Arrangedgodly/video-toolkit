@@ -9,6 +9,7 @@ import { validatePlan } from "../validate/validate.js";
 import { renderPlan } from "../render/render.js";
 import { diagnose } from "../hardware/diagnose.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
+import { catalogTransitions } from "../media/transitions.js";
 import { detectSilence } from "../analysis/silence.js";
 import { detectScenes } from "../analysis/scenes.js";
 import { extractFrames } from "../analysis/frames.js";
@@ -221,6 +222,12 @@ const TOOLS: ToolDef[] = [
       required: ["input"],
     },
   },
+  {
+    name: "video_transitions",
+    description:
+      "Crossfade transition kinds available on this ffmpeg build, parsed live from `ffmpeg -h filter=xfade` and cached per version — the discovery surface for a plan's crossfade.kind. Duration guidance: 0.2–1.0 s typical; fade is the cheapest and empirically validated kind; all kinds share the same duration/offset semantics.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 async function callTool(name: string, a: Record<string, unknown>): Promise<unknown> {
@@ -352,6 +359,8 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       return diagnose();
     case "video_benchmark":
       return benchmarkInput(String(a.input), { seconds: a.seconds as number | undefined });
+    case "video_transitions":
+      return catalogTransitions();
     default:
       throw new ToolError("OPERATION_INVALID", `unknown tool: ${name}`);
   }

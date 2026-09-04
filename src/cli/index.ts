@@ -7,6 +7,7 @@ import { renderPlan } from "../render/render.js";
 import { validatePlan } from "../validate/validate.js";
 import { diagnose } from "../hardware/diagnose.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
+import { catalogTransitions } from "../media/transitions.js";
 import { detectSilence } from "../analysis/silence.js";
 import { detectScenes } from "../analysis/scenes.js";
 import { extractFrames } from "../analysis/frames.js";
@@ -30,6 +31,8 @@ commands:
   render <plan>              final render from the validated plan
   diagnose                   environment + ffmpeg capabilities (JSON)
   benchmark <input>          measure fastest encoder/concurrency on this machine
+  transitions                crossfade kinds on this ffmpeg build (JSON;
+                             feeds the crossfade plan op's kind)
 
 analysis (timestamped observations; never render):
   detect-silence <input>     silence gaps [--threshold dB] [--min-duration s]
@@ -262,6 +265,10 @@ async function main(): Promise<void> {
     }
     case "diagnose": {
       emit(f, await diagnose());
+      return;
+    }
+    case "transitions": {
+      emit(f, await catalogTransitions({ noCache: f.noCache, debug: debugLine(f) }));
       return;
     }
     case "detect-silence": {

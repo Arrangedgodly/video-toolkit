@@ -18,7 +18,8 @@ export type ErrorCode =
   | "OPERATION_INVALID"
   | "MIX_INPUT_NOT_FOUND"
   | "TRANSCRIPTION_ENGINE_UNAVAILABLE"
-  | "TRANSCRIPTION_ENGINE_FAILED";
+  | "TRANSCRIPTION_ENGINE_FAILED"
+  | "FILTER_HELP_UNPARSEABLE";
 
 export class ToolError extends Error {
   readonly code: ErrorCode;

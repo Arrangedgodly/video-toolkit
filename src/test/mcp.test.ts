@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { runCapture } from "../media/ffprobe.js";
+import { CROSSFADE_KINDS } from "../core/schemas.js";
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
 const SERVER = path.resolve(import.meta.dirname, "..", "agent", "mcp-server.js");
@@ -82,15 +83,32 @@ test("initialize handshake", async () => {
   assert.ok(result.capabilities);
 });
 
-test("tools/list exposes exactly the CLI surface (16 tools)", async () => {
+test("tools/list exposes exactly the CLI surface (17 tools)", async () => {
   const r = await request("tools/list");
   const tools = (r.result as { tools: { name: string }[] }).tools.map((t) => t.name).sort();
   assert.deepEqual(tools, [
     "video_benchmark", "video_captions", "video_detect_filler", "video_detect_scenes",
     "video_detect_silence", "video_diagnose", "video_extract_frames", "video_find_highlights",
     "video_generate_proxy", "video_inspect", "video_plan", "video_preview", "video_render",
-    "video_review_frames", "video_transcribe", "video_validate",
+    "video_review_frames", "video_transcribe", "video_transitions", "video_validate",
   ]);
+});
+
+test("tools/call: transitions returns the live xfade catalog (CLI parity)", async () => {
+  const r = await request("tools/call", { name: "video_transitions", arguments: {} });
+  const result = r.result as { isError?: boolean; content: { text: string }[] };
+  assert.notEqual(result.isError, true);
+  const data = JSON.parse(result.content[0]!.text) as {
+    transitions: { kind: string }[];
+    count: number;
+    ffmpeg: string;
+  };
+  assert.ok(Array.isArray(data.transitions) && data.transitions.length > 0);
+  assert.equal(data.count, data.transitions.length);
+  assert.ok(data.ffmpeg.length > 0);
+  // every frozen crossfade kind must be discoverable here (T13's superset law)
+  const kinds = new Set(data.transitions.map((t) => t.kind));
+  for (const k of CROSSFADE_KINDS) assert.ok(kinds.has(k), `catalog missing frozen kind ${k}`);
 });
 
 test("tools/call: inspect returns the fixture facts", async () => {
