@@ -2,7 +2,7 @@
 
 Format rules for this file: DOC-CONVENTIONS (bottom). Updating behavior anywhere in src/ obligates updating the matching table here in the same change — see EXTENSION RULES.
 
-STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 review-frames + transcribe concurrency, M9 VTT + ship gate) · 172 tests (`npm test`, ~20 s; transcription tests skip without an engine) · binary `video` on PATH (npm link) · node ≥ 20, ffmpeg/ffprobe required.
+STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 review-frames + transcribe concurrency, M9 VTT + ship gate) · 185 tests (`npm test`, ~26 s; transcription tests skip without an engine) · binary `video` on PATH (npm link) · node ≥ 20, ffmpeg/ffprobe required.
 
 ## GLOSSARY (canonical terms — never synonymize)
 
@@ -18,7 +18,7 @@ STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 re
 
 ## COMMANDS
 
-Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → stderr. Global flags: `--pretty --debug --no-cache`. Timestamps: seconds (float), 3 decimals in emitted JSON.
+Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → stderr. Global flags: `--pretty --debug --no-cache`; `-h`/`--help` prints usage and exits 0 — as the first token or after any command. Timestamps: seconds (float), 3 decimals in emitted JSON.
 
 | command | args | own flags | stdout contract | cache |
 |---|---|---|---|---|
@@ -39,6 +39,8 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | `review-frames` | `<input>` | `--scenes <scenes.json> --per-boundary <n=4> --window <s=1.5> --size <w=480> --dir d` | `{dir, groups:[{boundary, frames[]}]}` (jpg paths) — per-boundary stills evenly spaced (interval midpoints) in `[boundary − window/2, boundary + window/2]` clamped to `[0, duration]`, downscaled to `--size` width; boundaries fully outside the source drop; empty report → `groups:[]` + `note` (not an error); non-integer/`<1` `--per-boundary` or `≤0` `--window` → `OPERATION_INVALID`; unparsable scenes file → `OBSERVATION_INVALID` | none (fresh stills like generate-proxy; scenes caching stays in detect-scenes) |
 | `generate-proxy` | `<input>` | `--width 480 --output f` | `{proxy, width, duration, wallMs, command[]}` | none |
 | `mcp` | — | — | MCP stdio server (see ADAPTERS) | — |
+| `help` | — | — | usage text on stdout, exit 0 — also reached by `-h`/`--help` (first token, or after any command: global usage, exit 0); bare `video` (no command) prints the same usage on stdout and exits 2, nothing on stderr | — |
+| `version` | — | — | `{toolkit:"0.1.0", ffmpeg:"<probed>"}` single-line JSON on stdout, exit 0; ffmpeg version probed live at call time (uncached) | none |
 
 ## WORKFLOWS (proven sequences; steps are the contract)
 

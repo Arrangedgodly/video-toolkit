@@ -68,6 +68,7 @@ flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_v
 
 interface CliFlags {
   positional: string[];
+  help: boolean;
   pretty: boolean;
   debug: boolean;
   noCache: boolean;
@@ -107,6 +108,7 @@ interface CliFlags {
 function parseArgs(argv: string[]): CliFlags {
   const f: CliFlags = {
     positional: [],
+    help: false,
     pretty: false,
     debug: false,
     noCache: false,
@@ -148,7 +150,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--keywords") f.keywords = argv[++i];
     else if (a === "--min-score") f.minScore = Number(argv[++i]);
     else if (a === "--plan") f.plan = argv[++i];
-    else if (a === "-h" || a === "--help") f.positional.push("__help__");
+    else if (a === "-h" || a === "--help") f.help = true;
     else f.positional.push(a);
   }
   return f;
@@ -183,10 +185,19 @@ async function main(): Promise<void> {
   const f = parseArgs(rest);
   const input = f.positional[0];
 
+  // -h/--help after a command (e.g. `video inspect --help`): global usage, exit 0 —
+  // it must never leak into positionals as an input path.
+  if (f.help) {
+    process.stdout.write(USAGE + "\n");
+    process.exit(0);
+  }
+
   switch (command) {
     case undefined:
     case "help":
     case "__help__":
+    case "-h":
+    case "--help":
       process.stdout.write(USAGE + "\n");
       process.exit(command ? 0 : 2);
     case "version": {
