@@ -79,7 +79,7 @@ const transcript = (segs: { s: number; e: number; text: string }[]) => ({
 });
 
 test("filler: matches single words and phrases with estimated times", () => {
-  const instances = detectFillerInstances(
+  const { instances } = detectFillerInstances(
     transcript([{ s: 10, e: 20, text: "So basically we built the toolkit" }]),
   );
   // "basically" is token 1 of 6 -> [11.667, 13.333]
@@ -90,7 +90,7 @@ test("filler: matches single words and phrases with estimated times", () => {
 });
 
 test("filler: multi-word phrases match and longest wins", () => {
-  const instances = detectFillerInstances(
+  const { instances } = detectFillerInstances(
     transcript([{ s: 0, e: 8, text: "you know I mean this works" }]),
     ["you know", "i mean", "you know i mean"],
   );
@@ -98,15 +98,18 @@ test("filler: multi-word phrases match and longest wins", () => {
 });
 
 test("filler: custom words only, punctuation ignored", () => {
-  const instances = detectFillerInstances(
+  const { instances } = detectFillerInstances(
     transcript([{ s: 0, e: 4, text: "Zorp, we did it. Zorp!" }]),
     ["zorp"],
   );
   assert.equal(instances.length, 2);
 });
 
-test("filler: empty transcript yields nothing", () => {
-  assert.deepEqual(detectFillerInstances(transcript([])), []);
+test("filler: empty transcript yields nothing, precision segments", () => {
+  assert.deepEqual(detectFillerInstances(transcript([])), {
+    instances: [],
+    precision: "segments",
+  });
 });
 
 // ---- T5: bounded parallel windows (fake engine; no Handy needed) ----

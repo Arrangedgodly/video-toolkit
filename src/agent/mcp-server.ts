@@ -148,7 +148,8 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "video_detect_filler",
-    description: "Filler-word candidates from a transcript report (times are estimates within segment granularity).",
+    description:
+      "Filler-word candidates from a transcript report; params.precision = \"words\" (exact per-word anchors, whisper-cpp --word-timestamps) or \"segments\" (linear estimates within segment granularity).",
     inputSchema: {
       type: "object",
       properties: {
@@ -295,9 +296,12 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       if (!parsed.success) {
         throw new ToolError("OBSERVATION_INVALID", "file is not a valid transcript report");
       }
+      const phrases = (a.words as string[] | undefined) ?? DEFAULT_FILLER_PHRASES;
+      const detection = detectFillerInstances(parsed.data, phrases);
       return {
-        instances: detectFillerInstances(parsed.data, (a.words as string[] | undefined) ?? DEFAULT_FILLER_PHRASES),
+        instances: detection.instances,
         duration: parsed.data.duration,
+        params: { phrases, precision: detection.precision },
       };
     }
     case "video_find_highlights": {

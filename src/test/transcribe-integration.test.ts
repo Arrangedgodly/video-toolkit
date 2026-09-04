@@ -85,7 +85,7 @@ test("transcribe: real speech -> timestamped segments (parakeet via handy)", { s
   }
 
   // filler detection over the real transcript
-  const fillers = detectFillerInstances(report);
+  const { instances: fillers } = detectFillerInstances(report);
   if (fillers.length > 0) {
     for (const inst of fillers) {
       assert.ok(inst.start < inst.end);
@@ -129,7 +129,7 @@ test("detect-filler works from a saved transcript file", async () => {
     segments: [{ start: 0, end: 6, text: "Um so we built it, you know" }],
   });
   await writeFile("t.json", JSON.stringify(doc));
-  const instances = detectFillerInstances(doc);
+  const { instances } = detectFillerInstances(doc);
   const phrases = instances.map((i) => i.phrase);
   assert.ok(phrases.includes("um"));
   assert.ok(phrases.includes("you know"));
@@ -202,4 +202,59 @@ test("transcribe: whisper-cpp without --word-timestamps -> segments, no words; c
     w1lines.join("; "),
   );
   assert.ok(hit.segments.every((s) => s.words && s.words.length >= 1));
+});
+
+// ---- T11: filler precision on a REAL word-timestamped transcript ----
+
+test("detect-filler: words transcript -> precision words, instances exactly word-anchored (real engine)", { skip: !whisperAvailable }, async () => {
+  const report = await transcribeInput(FIXTURE, { engine: "whisper-cpp", wordTimestamps: true });
+  const exact = detectFillerInstances(report);
+  assert.equal(exact.precision, "words"); // every segment carries words
+  assert.ok(
+    exact.instances.length >= 1,
+    `expected fillers in ${JSON.stringify(report.segments.map((s) => s.text))}`,
+  );
+
+  // ground truth from whisper's own word data: the set of consecutive-word
+  // windows (first-word start -> last-word end). Every exact-mode instance
+  // must BE one of those windows — never an interpolation.
+  const windows = new Set<string>();
+  for (const seg of report.segments) {
+    const norm = (seg.words ?? []).map((w) => w.text.toLowerCase().replace(/[^a-z']/g, ""));
+    for (let i = 0; i < norm.length; i++) {
+      for (let len = 1; len <= Math.min(3, norm.length - i); len++) {
+        const span = norm.slice(i, i + len);
+        if (span.some((w) => !w)) break; // a non-word token cannot anchor a phrase
+        windows.add(`${span.join(" ")}@${seg.words![i]!.start}-${seg.words![i + len - 1]!.end}`);
+      }
+    }
+  }
+  for (const inst of exact.instances) {
+    assert.ok(
+      windows.has(`${inst.phrase}@${inst.start}-${inst.end}`),
+      `instance not word-anchored: ${JSON.stringify(inst)}`,
+    );
+  }
+
+  // same transcript with words stripped: precision flips to segments and the
+  // times leave the exact word windows (the estimate path can only bound a
+  // filler to within segment granularity). Words reconstruct each segment
+  // text (T10 merge contract), so both paths find the SAME matches.
+  const stripped = {
+    ...report,
+    segments: report.segments.map((s) => ({ start: s.start, end: s.end, text: s.text })),
+  };
+  const est = detectFillerInstances(stripped);
+  assert.equal(est.precision, "segments");
+  assert.equal(est.instances.length, exact.instances.length);
+  assert.deepEqual(
+    est.instances.map((i) => i.phrase),
+    exact.instances.map((i) => i.phrase),
+  );
+  assert.ok(
+    exact.instances.some(
+      (inst, i) => inst.start !== est.instances[i]!.start || inst.end !== est.instances[i]!.end,
+    ),
+    "estimate times should differ from the exact word anchors on this fixture",
+  );
 });

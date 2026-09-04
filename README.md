@@ -57,6 +57,9 @@ video detect-scenes <input>        scene-cut boundaries
 video transcribe <input>           timestamped transcript (--engine handy|whisper-cpp;
                                    --word-timestamps = per-word times via whisper-cpp)
 video detect-filler <t.json>       filler-word candidates from a transcript
+                                   (params.precision: "words" = exact per-word
+                                   anchors when the transcript carries word
+                                   timings, "segments" = estimates)
 video find-highlights <input>      highlight proposals (--transcript, --keywords)
 video captions <t.json>            transcript → .srt or .vtt; --plan remaps cue times through cuts
 video extract-frame <input>        jpg stills at --at t1,t2 / --count N
@@ -79,7 +82,7 @@ video plan input.mp4 --cuts-from filler.json  [--filler-pad-before 0.10] [--fill
 video plan input.mp4 --highlights-from highlights.json [--count 5] [--min-score 0.35] [--pad 0.5]
 ```
 
-Silence gaps and filler instances become `cut` ops (filler times are linear estimates — verify with `extract-frame --at` before rendering); highlight candidates become a `trim`-compilation replacing the whole-source keep. One bridge per invocation. The parameters are the editorial decisions; whatever you delete or tune afterwards is judgment.
+Silence gaps and filler instances become `cut` ops (filler times are exact per-word anchors when the transcript carries word timings — `params.precision: "words"`; linear estimates otherwise — verify with `extract-frame --at` in that mode); highlight candidates become a `trim`-compilation replacing the whole-source keep. One bridge per invocation. The parameters are the editorial decisions; whatever you delete or tune afterwards is judgment.
 
 ## The edit plan
 

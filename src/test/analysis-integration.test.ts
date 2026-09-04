@@ -439,3 +439,76 @@ test("benchmark on audio-only -> UNSUPPORTED_MEDIA on stderr, exit 1", async () 
   assert.equal(r.code, 1);
   assert.equal(stderrErrorCode(r.stderr), "UNSUPPORTED_MEDIA");
 });
+
+// ---- T11: filler precision (exact word times vs segment estimates) ----
+
+interface FillerCliReport {
+  instances: { start: number; end: number; phrase: string; context: string }[];
+  duration?: number;
+  params?: { phrases: string[]; precision: string };
+}
+
+const wordsTranscript = {
+  segments: [
+    {
+      start: 1,
+      end: 3.6,
+      text: "Um, so basically filler precision.",
+      words: [
+        { start: 1.0, end: 1.4, text: "Um," },
+        { start: 1.4, end: 1.6, text: "so" },
+        { start: 1.6, end: 2.4, text: "basically," },
+        { start: 2.4, end: 3.0, text: "filler" },
+        { start: 3.0, end: 3.6, text: "precision." },
+      ],
+    },
+  ],
+};
+
+test("detect-filler: words transcript -> params.precision words, exact word times", async () => {
+  await writeFile("words-t.json", JSON.stringify(wordsTranscript));
+  const r = await runCli<FillerCliReport>("detect-filler", "words-t.json");
+  assert.equal(r.params?.precision, "words");
+  assert.deepEqual(r.instances, [
+    { start: 1, end: 1.4, phrase: "um", context: "Um, so basically, filler" },
+    { start: 1.6, end: 2.4, phrase: "basically", context: "Um, so basically, filler precision." },
+  ]);
+});
+
+test("detect-filler: wordless transcript -> params.precision segments, interpolated times", async () => {
+  const legacy = {
+    segments: wordsTranscript.segments.map(({ words: _w, ...s }) => s),
+  };
+  await writeFile("legacy-t.json", JSON.stringify(legacy));
+  const r = await runCli<FillerCliReport>("detect-filler", "legacy-t.json");
+  assert.equal(r.params?.precision, "segments");
+  // 5 tokens over a 2.6 s segment: um [1, 1.52], basically [2.04, 2.56] —
+  // the linear estimates, not the word anchors [1,1.4]/[1.6,2.4]
+  assert.deepEqual(
+    r.instances.map((i) => [i.phrase, i.start, i.end]),
+    [
+      ["um", 1, 1.52],
+      ["basically", 2.04, 2.56],
+    ],
+  );
+});
+
+test("plan --cuts-from: filler pads expand from the exact word times (full chain)", async () => {
+  const det = await runCli<FillerCliReport>("detect-filler", "words-t.json");
+  await writeFile("t11-filler.json", JSON.stringify(det));
+  const plan = await runCli<{ operations: { type: string; start: number; end: number }[] }>(
+    "plan",
+    SILENCE,
+    "--cuts-from",
+    "t11-filler.json",
+    "--filler-pad-before",
+    "0.1",
+    "--filler-pad-end",
+    "0.25",
+  );
+  // pads apply on the EXACT times: [1-0.1, 1.4+0.25] and [1.6-0.1, 2.4+0.25]
+  assert.deepEqual(plan.operations.slice(1), [
+    { type: "cut", start: 0.9, end: 1.65 },
+    { type: "cut", start: 1.5, end: 2.65 },
+  ]);
+});

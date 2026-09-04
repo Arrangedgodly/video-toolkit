@@ -6,6 +6,10 @@ import { silenceToCuts } from "../analysis/silence-to-cuts.js";
 import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
 import { fillerToCuts } from "../analysis/filler-to-cuts.js";
 import { planReviewGroups } from "../analysis/review-frames.js";
+import {
+  detectFillerInstances,
+  DEFAULT_FILLER_PHRASES,
+} from "../analysis/filler.js";
 
 test("parseSilenceOutput pairs starts with ends in order", () => {
   const stderr = [
@@ -331,4 +335,238 @@ test("planReviewGroups rejects invalid parameters with OPERATION_INVALID", () =>
       (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
     );
   }
+});
+
+// ---- T11: filler precision (exact times from segment.words) ----
+
+const wordSeg = (
+  s: number,
+  e: number,
+  text: string,
+  words: { start: number; end: number; text: string }[],
+) => ({ start: s, end: e, text, words });
+
+test("filler: word-timed segments anchor exact word times, precision words", () => {
+  const t = {
+    segments: [
+      wordSeg(
+        10,
+        16,
+        "Um, so basically this is filler precision.",
+        [
+          { start: 10.0, end: 10.4, text: "Um," },
+          { start: 10.4, end: 10.6, text: "so" },
+          { start: 10.6, end: 11.4, text: "basically," },
+          { start: 11.4, end: 11.9, text: "this" },
+          { start: 11.9, end: 12.1, text: "is" },
+          { start: 12.1, end: 12.7, text: "filler" },
+          { start: 12.7, end: 13.3, text: "precision." },
+        ],
+      ),
+    ],
+  };
+  assert.deepEqual(detectFillerInstances(t), {
+    precision: "words",
+    instances: [
+      { start: 10, end: 10.4, phrase: "um", context: "Um, so basically, this" },
+      { start: 10.6, end: 11.4, phrase: "basically", context: "Um, so basically, this is filler" },
+    ],
+  });
+});
+
+test("filler: multi-word phrase anchors first-word start to last-word end", () => {
+  // note the 0.5 s gap between "you" and "know," — exact anchoring uses the
+  // word times verbatim, never a proportional interpolation over the span
+  const t = {
+    segments: [
+      wordSeg(0, 5, "Well you know it works", [
+        { start: 0.0, end: 0.5, text: "Well" },
+        { start: 0.5, end: 0.9, text: "you" },
+        { start: 1.4, end: 1.8, text: "know," },
+        { start: 1.8, end: 2.2, text: "it" },
+        { start: 2.2, end: 2.5, text: "works" },
+      ]),
+    ],
+  };
+  assert.deepEqual(detectFillerInstances(t), {
+    precision: "words",
+    instances: [
+      { start: 0.5, end: 1.8, phrase: "you know", context: "Well you know, it works" },
+    ],
+  });
+});
+
+test("filler: word-text matching normalizes case, punctuation and leading spaces", () => {
+  const t = {
+    segments: [
+      wordSeg(0, 4, "Um, you know?", [
+        { start: 0.1, end: 0.5, text: " Um, " }, // whisper habit: leading space + comma
+        { start: 0.6, end: 0.8, text: "You" },
+        { start: 0.8, end: 1.2, text: "KNOW?" },
+      ]),
+    ],
+  };
+  const { instances } = detectFillerInstances(t);
+  assert.deepEqual(
+    instances.map((i) => [i.phrase, i.start, i.end]),
+    [
+      ["um", 0.1, 0.5],
+      ["you know", 0.6, 1.2],
+    ],
+  );
+});
+
+test("filler: matched words are consumed and the longest phrase wins (words path)", () => {
+  const t = {
+    segments: [
+      wordSeg(0, 3, "um um you know you know", [
+        { start: 0.0, end: 0.3, text: "um" },
+        { start: 0.3, end: 0.6, text: "um" },
+        { start: 0.6, end: 0.9, text: "you" },
+        { start: 0.9, end: 1.2, text: "know" },
+        { start: 1.2, end: 1.5, text: "you" },
+        { start: 1.5, end: 1.8, text: "know" },
+      ]),
+    ],
+  };
+  const { instances } = detectFillerInstances(t);
+  assert.deepEqual(
+    instances.map((i) => [i.phrase, i.start, i.end]),
+    [
+      ["um", 0, 0.3],
+      ["um", 0.3, 0.6],
+      ["you know", 0.6, 1.2],
+      ["you know", 1.2, 1.8],
+    ],
+  );
+  // longest phrase wins: "um um" as a custom phrase consumes both words
+  const { instances: consumed } = detectFillerInstances(t, ["um", "um um"]);
+  assert.deepEqual(
+    consumed.map((i) => [i.phrase, i.start, i.end]),
+    [["um um", 0, 0.6]],
+  );
+});
+
+test("filler: phrases never match across segment boundaries (both paths)", () => {
+  const withWords = {
+    segments: [
+      wordSeg(0, 2, "and then you", [
+        { start: 0.0, end: 0.5, text: "and" },
+        { start: 0.5, end: 1.0, text: "then" },
+        { start: 1.0, end: 2.0, text: "you" },
+      ]),
+      wordSeg(2, 4, "know the rest", [
+        { start: 2.0, end: 2.4, text: "know" },
+        { start: 2.4, end: 2.6, text: "the" },
+        { start: 2.6, end: 4.0, text: "rest." },
+      ]),
+    ],
+  };
+  // a cross-boundary matcher would pair "you"(1.0-2.0) with "know"(2.0-2.4)
+  const exact = detectFillerInstances(withWords, ["you know"]);
+  assert.deepEqual(exact.instances, []);
+  assert.equal(exact.precision, "words");
+  const wordless = {
+    segments: withWords.segments.map(({ words: _w, ...s }) => s),
+  };
+  assert.deepEqual(detectFillerInstances(wordless, ["you know"]).instances, []);
+});
+
+test("filler: precision is words only when EVERY segment carries words", () => {
+  const mixed = {
+    segments: [
+      wordSeg(0, 2, "um here", [
+        { start: 0.1, end: 0.4, text: "um" },
+        { start: 0.5, end: 1.9, text: "here" },
+      ]),
+      { start: 2, end: 6, text: "you know later" },
+    ],
+  };
+  const { instances, precision } = detectFillerInstances(mixed);
+  assert.equal(precision, "segments"); // one wordless segment drops the report-level claim
+  assert.deepEqual(instances[0], { start: 0.1, end: 0.4, phrase: "um", context: "um here" }); // still exact where words exist
+  // the wordless segment interpolates: 3 tokens over [2,6] -> [2, 4.667]
+  assert.equal(instances[1]!.phrase, "you know");
+  assert.ok(Math.abs(instances[1]!.start - 2) < 0.001);
+  assert.ok(Math.abs(instances[1]!.end - 4.667) < 0.001);
+});
+
+test("filler: an empty words array falls back to interpolation", () => {
+  const t = { segments: [{ start: 0, end: 2, text: "um here", words: [] }] };
+  const { instances, precision } = detectFillerInstances(t);
+  assert.equal(precision, "segments");
+  assert.deepEqual(instances.map((i) => [i.start, i.end]), [[0, 1]]);
+});
+
+test("filler: wordless transcripts keep the pre-T11 estimate output byte-identical (regression lock)", () => {
+  // expected values captured from the pre-T11 detector on the same inputs
+  const single = detectFillerInstances({
+    segments: [
+      {
+        start: 10,
+        end: 16,
+        text: "Um, so basically this is the video toolkit transcription test. You know, it should find these words.",
+      },
+    ],
+  }, DEFAULT_FILLER_PHRASES);
+  assert.equal(single.precision, "segments");
+  assert.equal(
+    JSON.stringify(single.instances),
+    JSON.stringify([
+      { start: 10, end: 10.353, phrase: "um", context: "Um, so basically this" },
+      { start: 10.706, end: 11.059, phrase: "basically", context: "Um, so basically this is the" },
+      { start: 13.529, end: 14.235, phrase: "you know", context: "toolkit transcription test. You know, it should find" },
+    ]),
+  );
+  const multi = detectFillerInstances({
+    segments: [
+      { start: 0, end: 4.5, text: "Well you um like that" },
+      { start: 4.5, end: 9, text: "know what I mean, honestly" },
+    ],
+  }, DEFAULT_FILLER_PHRASES);
+  assert.equal(
+    JSON.stringify(multi.instances),
+    JSON.stringify([
+      { start: 1.8, end: 2.7, phrase: "um", context: "Well you um like that" },
+      { start: 2.7, end: 3.6, phrase: "like", context: "Well you um like that" },
+      { start: 6.3, end: 8.1, phrase: "i mean", context: "know what I mean, honestly" },
+      { start: 8.1, end: 9, phrase: "honestly", context: "what I mean, honestly" },
+    ]),
+  );
+});
+
+test("filler: words path is deterministic for identical input", () => {
+  const t = {
+    segments: [
+      wordSeg(0, 5, "you know it works", [
+        { start: 0.5, end: 0.9, text: "you" },
+        { start: 0.9, end: 1.3, text: "know" },
+        { start: 1.3, end: 1.7, text: "it" },
+        { start: 1.7, end: 2.1, text: "works" },
+      ]),
+    ],
+  };
+  assert.deepEqual(detectFillerInstances(t), detectFillerInstances(t));
+});
+
+test("fillerToCuts pads expand from the exact word-anchored times", () => {
+  const t = {
+    segments: [
+      wordSeg(0, 4, "well um done", [
+        { start: 0.5, end: 0.8, text: "well" },
+        { start: 1.0, end: 1.3, text: "um" },
+        { start: 1.5, end: 2.2, text: "done" },
+      ]),
+    ],
+  };
+  const { instances, precision } = detectFillerInstances(t);
+  assert.equal(precision, "words");
+  assert.deepEqual(
+    fillerToCuts(
+      { instances, params: { phrases: DEFAULT_FILLER_PHRASES, precision } },
+      30,
+      { padBefore: 0.1, padEnd: 0.25 },
+    ),
+    [{ type: "cut", start: 0.9, end: 1.55 }],
+  );
 });

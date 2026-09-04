@@ -379,10 +379,11 @@ async function main(): Promise<void> {
       const phrases = f.words
         ? f.words.split(",").map((w) => w.trim()).filter(Boolean)
         : DEFAULT_FILLER_PHRASES;
+      const detection = detectFillerInstances(parsed.data, phrases);
       emit(f, {
-        instances: detectFillerInstances(parsed.data, phrases),
+        instances: detection.instances,
         duration: parsed.data.duration,
-        params: { phrases },
+        params: { phrases, precision: detection.precision },
       });
       return;
     }

@@ -217,7 +217,16 @@ export const FillerReport = z.object({
   instances: z.array(FillerInstance),
   duration: z.number().optional(),
   note: z.string().optional(),
-  params: z.object({ phrases: z.array(z.string()) }).optional(),
+  params: z
+    .object({
+      phrases: z.array(z.string()),
+      /** which timing source produced the instance times: exact per-word
+       * anchors ("words", from segments[].words) vs linear interpolation
+       * within each segment ("segments"). Optional so pre-T11 filler
+       * reports (params without precision) still parse. */
+      precision: z.enum(["words", "segments"]).optional(),
+    })
+    .optional(),
 });
 
 export const HighlightCandidate = z.object({
