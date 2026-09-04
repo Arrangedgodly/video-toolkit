@@ -109,6 +109,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     (op): op is Extract<(typeof plan.operations)[number], { type: "captions" }> =>
       op.type === "captions",
   );
+  const overlayTextOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "overlay-text" }> =>
+      op.type === "overlay-text",
+  );
   const audioMixOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
       op.type === "audio-mix",
@@ -180,6 +184,18 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
           : null,
       subtitleFile: captionsOp?.file,
       subtitleStyle: captionsOp?.style,
+      // overlay-text defaults: position bottom, 48 px, white, boxed
+      overlayText: overlayTextOp
+        ? {
+            text: overlayTextOp.text,
+            from: overlayTextOp.from,
+            to: overlayTextOp.to,
+            position: overlayTextOp.position ?? "bottom",
+            fontsize: overlayTextOp.fontsize ?? 48,
+            color: overlayTextOp.color ?? "white",
+            box: overlayTextOp.box ?? true,
+          }
+        : undefined,
       mix,
     },
     hasAudio,

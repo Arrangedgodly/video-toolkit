@@ -55,7 +55,9 @@ agent adapter:
 
 plan operations: trim (keep range), cut (remove range), normalize-audio,
   speed (factor), resize (width[, height]), volume (db|factor),
-  audio-mix (file, level dB, duck{threshold LINEAR, ratio, attack ms, release ms});
+  audio-mix (file, level dB, duck{threshold LINEAR, ratio, attack ms, release ms}),
+  overlay-text (text; output-timeline window from/to; position top|center|bottom;
+  fontsize, color, box);
   transform ops are global — at most one of each per plan.
 
 flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_videotoolbox>

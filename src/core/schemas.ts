@@ -51,6 +51,37 @@ export const CaptionsOp = z.object({
   style: z.string().optional(),
 });
 
+/** Burn one text overlay (title card / lower third) during the single render
+ * pass — ONE drawtext on the OUTPUT timeline (like captions). The text value
+ * passes through TWO ffmpeg unescaping stages (filtergraph tokenizer, then
+ * the option-value tokenizer), so it needs its own escaping helper
+ * (escapeDrawText) — never reuse escapeFilterText for it. */
+export const OverlayTextOp = z.object({
+  type: z.literal("overlay-text"),
+  /** literal text to burn; `%` is NOT special (expansion=none) */
+  text: z.string().min(1).max(1024),
+  /** visibility window on the OUTPUT timeline (s); both absent = always visible */
+  from: z.number().min(0).optional(),
+  to: z.number().min(0).optional(),
+  /** vertical placement; default "bottom" */
+  position: z.enum(["top", "center", "bottom"]).optional(),
+  /** font size in output px; default 48 */
+  fontsize: z.number().int().gt(0).max(512).optional(),
+  /** ffmpeg color name or 0xRRGGBB[AA]; default "white". Filter-syntax
+   * characters are rejected by the shape so the value can never need
+   * escaping. */
+  color: z
+    .string()
+    .max(64)
+    .regex(
+      /^(?:0x[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?|[A-Za-z][A-Za-z0-9_]*)$/,
+      "must be 0xRRGGBB[AA] hex or an alphanumeric color name",
+    )
+    .optional(),
+  /** semi-transparent backing box; default true */
+  box: z.boolean().optional(),
+});
+
 /** Sidechain ducking parameters — map 1:1 to sidechaincompress filter keys
  * (validated graph: docs/ultron/research/r1-audio-mix-single-pass.md). */
 export const AudioMixDuck = z.object({
@@ -82,7 +113,13 @@ export const AudioMixOp = z.object({
 
 /** Transform ops apply to the whole output; they never affect which source
  * ranges are kept (that stays the trim/cut pair). At most one of each. */
-export type TransformOpType = "speed" | "resize" | "volume" | "captions" | "audio-mix";
+export type TransformOpType =
+  | "speed"
+  | "resize"
+  | "volume"
+  | "captions"
+  | "overlay-text"
+  | "audio-mix";
 
 export const Operation = z.discriminatedUnion("type", [
   TrimOp,
@@ -92,6 +129,7 @@ export const Operation = z.discriminatedUnion("type", [
   ResizeOp,
   VolumeOp,
   CaptionsOp,
+  OverlayTextOp,
   AudioMixOp,
 ]);
 

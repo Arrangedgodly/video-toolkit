@@ -23,6 +23,28 @@ export function escapeFilterText(s: string): string {
   return out;
 }
 
+/** Fixed overlay-text font — a documented machine fact (AGENTS.md
+ * ENVIRONMENT FACTS): present and rendering via this build's freetype.
+ * Missing file → OPERATION_INVALID at validate time. */
+export const OVERLAY_FONT_FILE = "/System/Library/Fonts/Helvetica.ttc";
+
+/** Escape literal text for drawtext's `text=` value. Unlike other filter
+ * values, drawtext text crosses TWO unescaping stages — the filtergraph
+ * tokenizer (`\x`→x, quotes spliced) and then the option-value tokenizer
+ * (same rules again, `:`-separated) — so backslash prefixes must survive one
+ * collapse: `\`→4 backslashes, `'`→3, `:`→2, filter separators `,;[]`→1
+ * (they are only special at stage 1). `%` is passed through raw because the
+ * builder always sets expansion=none. Empirically verified on this ffmpeg
+ * build: renders pixel-identical to a textfile= ground truth for the full
+ * hostile set (`:` `'` `%` `\` `,` `;` `[` `]`). */
+export function escapeDrawText(s: string): string {
+  let out = s.replace(/\\/g, "\\\\\\\\"); // 1 backslash -> 4
+  out = out.replace(/'/g, "\\\\\\'"); // ' -> 3 backslashes + '
+  out = out.replace(/:/g, "\\\\:"); // : -> 2 backslashes + :
+  out = out.replace(/([,;[\]])/g, "\\$1"); // separators -> 1 backslash
+  return out;
+}
+
 export interface RenderOptions {
   encoder: EncoderId;
   /** software path (libx264) */
@@ -44,10 +66,31 @@ export interface RenderOptions {
   /** burn this .srt during the same pass (output-timeline cue times) */
   subtitleFile?: string;
   subtitleStyle?: string;
+  /** burn one text overlay (drawtext) during the same pass — OUTPUT-timeline
+   * window like captions, after scale/subtitles so fontsize is in output px */
+  overlayText?: OverlayTextOptions;
   /** when set (and the source has audio), mix a music bed under the program
    * audio with speech-keyed sidechain ducking — still one ffmpeg pass
    * (graph validated in docs/ultron/research/r1-audio-mix-single-pass.md) */
   mix?: MixOptions | null;
+}
+
+/** One burned text overlay (plan op `overlay-text`; defaults applied by the
+ * render layer). Times are OUTPUT-timeline seconds; the enable window gates
+ * the drawtext on the same retimed frames captions burn into. */
+export interface OverlayTextOptions {
+  text: string;
+  /** visibility window start (s); undefined = from the first frame */
+  from?: number;
+  /** visibility window end (s); undefined = to the last frame */
+  to?: number;
+  position: "top" | "center" | "bottom";
+  /** output px */
+  fontsize: number;
+  /** ffmpeg color spec (schema-validated: hex or alphanumeric name) */
+  color: string;
+  /** semi-transparent backing box (box=1:boxcolor=black@0.5:boxborderw=12) */
+  box: boolean;
 }
 
 export interface MixDuckOptions {
@@ -171,6 +214,40 @@ function buildMixFilterGraph(
   );
 }
 
+/** ONE drawtext filter for the overlay-text op. Deterministic placement:
+ * x centered, y per position with fixed 10%-of-height margins. Omitted
+ * window bounds are unbounded (gte/lte); both present = between. Times at
+ * 3 decimals like every emitted timestamp. */
+function drawTextFilter(o: OverlayTextOptions): string {
+  const y =
+    o.position === "top"
+      ? "h*0.1"
+      : o.position === "center"
+        ? "(h-text_h)/2"
+        : "h-text_h-h*0.1";
+  const parts = [
+    `fontfile=${escapeFilterPath(OVERLAY_FONT_FILE)}`,
+    `text=${escapeDrawText(o.text)}`,
+    `fontsize=${o.fontsize}`,
+    `fontcolor=${o.color}`,
+    "x=(w-text_w)/2",
+    `y=${y}`,
+  ];
+  if (o.box) parts.push("box=1", "boxcolor=black@0.5", "boxborderw=12");
+  // part of the escaping contract: `%` stays literal in the text
+  parts.push("expansion=none");
+  const window =
+    o.from !== undefined && o.to !== undefined
+      ? `between(t,${o.from.toFixed(3)},${o.to.toFixed(3)})`
+      : o.from !== undefined
+        ? `gte(t,${o.from.toFixed(3)})`
+        : o.to !== undefined
+          ? `lte(t,${o.to.toFixed(3)})`
+          : undefined;
+  if (window) parts.push(`enable='${window}'`);
+  return `drawtext=${parts.join(":")}`;
+}
+
 /**
  * Build the single-pass render command for a compiled timeline.
  * All trims/cuts become one select filter over the source — no intermediate
@@ -198,6 +275,7 @@ export function buildRenderCommand(
             (opts.subtitleStyle ? `:force_style='${escapeFilterText(opts.subtitleStyle)}'` : ""),
         ]
       : []),
+    ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
     "format=yuv420p",
   ].join(",");
 

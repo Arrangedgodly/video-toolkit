@@ -60,6 +60,59 @@ test("normalize-audio target bounds enforced", () => {
   );
 });
 
+test("overlay-text parses minimal and full forms", () => {
+  const minimal = EditPlan.parse({ ...base, operations: [{ type: "overlay-text", text: "Title" }] });
+  assert.equal(minimal.operations[0]?.type, "overlay-text");
+
+  const full = EditPlan.parse({
+    ...base,
+    operations: [{
+      type: "overlay-text",
+      text: "It's 100% done",
+      from: 0.5,
+      to: 4,
+      position: "center",
+      fontsize: 72,
+      color: "0xFFCC0080",
+      box: false,
+    }],
+  });
+  assert.equal(full.operations.length, 1);
+});
+
+test("overlay-text bounds enforced: text, window, position, fontsize, color shape", () => {
+  const bad: unknown[] = [
+    { type: "overlay-text" }, // text is required
+    { type: "overlay-text", text: "" },
+    { type: "overlay-text", text: "x".repeat(1025) },
+    { type: "overlay-text", text: "x", from: -1 },
+    { type: "overlay-text", text: "x", to: -0.5 },
+    { type: "overlay-text", text: "x", position: "middle" },
+    { type: "overlay-text", text: "x", fontsize: 0 },
+    { type: "overlay-text", text: "x", fontsize: 513 },
+    { type: "overlay-text", text: "x", fontsize: 48.5 }, // non-integer
+    { type: "overlay-text", text: "x", color: "white;" }, // filter syntax
+    { type: "overlay-text", text: "x", color: "red,blue" },
+    { type: "overlay-text", text: "x", color: "0x12345" }, // 5 hex digits
+    { type: "overlay-text", text: "x", color: "#ffffff" }, // # form not accepted
+  ];
+  for (const op of bad) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [op] }).success,
+      false,
+      `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+  // 0xRRGGBB and 0xRRGGBBAA hex and plain names are fine
+  for (const color of ["white", "LightBlue", "0xFFFFFF", "0xffcc0080", "gray42"]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [{ type: "overlay-text", text: "x", color }] }).success,
+      true,
+      `expected color accepted: ${color}`,
+    );
+  }
+});
+
 test("audio-mix parses minimal and full forms", () => {
   const minimal = EditPlan.parse({ ...base, operations: [{ type: "audio-mix", file: "bed.mp3" }] });
   assert.equal(minimal.operations[0]?.type, "audio-mix");

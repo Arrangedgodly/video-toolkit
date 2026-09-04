@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EditPlan } from "../core/schemas.js";
-import { atempoChain, buildRenderCommand, type MixOptions } from "../media/ffmpeg.js";
+import { atempoChain, buildRenderCommand, escapeDrawText, type MixOptions } from "../media/ffmpeg.js";
 
 const base = {
   version: 1,
@@ -204,4 +204,93 @@ test("builder: mix on an audio-less source is a no-op (no bed input, no graph)",
   assert.equal(argv.includes("-stream_loop"), false);
   assert.equal(argv.filter((a) => a === "-i").length, 1);
   assert.ok(argv.includes("-an"));
+});
+
+// ---- overlay-text (drawtext; escaping empirically verified against this
+// ffmpeg build: pixel-identical renders vs a textfile= ground truth)
+
+const overlay = {
+  text: "Hello World",
+  position: "bottom" as "top" | "center" | "bottom",
+  fontsize: 48,
+  color: "white",
+  box: true,
+};
+
+test("escapeDrawText: drawtext's own two-pass escaping rule", () => {
+  // drawtext text crosses TWO unescaping stages (filtergraph tokenizer +
+  // option-value tokenizer): `\`->4 backslashes, `'`->3, `:`->2, `,;[]`->1
+  assert.equal(escapeDrawText("Hello World"), "Hello World");
+  assert.equal(escapeDrawText("a:b"), "a\\\\:b");
+  assert.equal(escapeDrawText("a,b"), "a\\,b");
+  assert.equal(escapeDrawText("it's"), "it\\\\\\'s");
+  // `C:\path` -> C, 2BS+":" (colon rule), 4BS (backslash rule), path
+  assert.equal(escapeDrawText("C:\\path"), "C" + "\\\\" + ":" + "\\\\\\\\" + "path");
+  assert.equal(escapeDrawText("100% sure"), "100% sure"); // literal under expansion=none
+  assert.equal(escapeDrawText("semi;colon"), "semi\\;colon");
+  assert.equal(escapeDrawText("brack[et]"), "brack\\[et\\]");
+  assert.equal(
+    escapeDrawText("Rate: 50%, it's #1; top [v2]"),
+    "Rate\\\\: 50%\\, it\\\\\\'s #1\\; top \\[v2\\]",
+  );
+});
+
+test("builder: overlay-text drawtext composes after scale/subtitles, before format", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts,
+    scaleWidth: 640,
+    subtitleFile: "subs.srt",
+    overlayText: { ...overlay, text: "Hello: it's 100% done" },
+  }, true);
+  const vf = argv[argv.indexOf("-vf") + 1]!;
+  const iScale = vf.indexOf("scale=640:-2");
+  const iSubs = vf.indexOf("subtitles=");
+  const iDraw = vf.indexOf("drawtext=");
+  const iFmt = vf.indexOf("format=yuv420p");
+  assert.ok(iScale !== -1 && iSubs !== -1 && iDraw !== -1 && iFmt !== -1, vf);
+  assert.ok(iScale < iDraw && iSubs < iDraw && iDraw < iFmt, `drawtext must sit between scale/subtitles and format: ${vf}`);
+  // defaults + the fixed font + the escaped text + expansion=none
+  assert.ok(vf.includes("fontfile=/System/Library/Fonts/Helvetica.ttc"), vf);
+  assert.ok(vf.includes("text=Hello\\\\: it\\\\\\'s 100% done"), vf);
+  assert.ok(vf.includes("fontsize=48"), vf);
+  assert.ok(vf.includes("fontcolor=white"), vf);
+  assert.ok(vf.includes("box=1:boxcolor=black@0.5:boxborderw=12"), vf);
+  assert.ok(vf.includes("expansion=none"), vf);
+  assert.ok(!vf.includes("enable="), "no window given -> always visible, no enable");
+});
+
+test("builder: overlay-text enable window math incl. omitted bounds (3-decimal times)", () => {
+  const both = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, overlayText: { ...overlay, from: 0.5, to: 2 },
+  }, true);
+  const fromOnly = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, overlayText: { ...overlay, from: 1 },
+  }, true);
+  const toOnly = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, overlayText: { ...overlay, to: 3.4567 },
+  }, true);
+  assert.ok(both[both.indexOf("-vf") + 1]!.includes("enable='between(t,0.500,2.000)'"));
+  assert.ok(fromOnly[fromOnly.indexOf("-vf") + 1]!.includes("enable='gte(t,1.000)'"));
+  assert.ok(toOnly[toOnly.indexOf("-vf") + 1]!.includes("enable='lte(t,3.457)'"));
+});
+
+test("builder: overlay-text positions map to y expressions; box off; custom fontsize/color", () => {
+  const yFor = (o: Partial<typeof overlay>) => {
+    const argv = buildRenderCommand("in.mp4", segs, "out.mp4", { ...opts, overlayText: { ...overlay, ...o } }, true);
+    const vf = argv[argv.indexOf("-vf") + 1]!;
+    return /y=([^:]+):/.exec(vf)?.[1] ?? "";
+  };
+  assert.equal(yFor({ position: "top" }), "h*0.1");
+  assert.equal(yFor({ position: "center" }), "(h-text_h)/2");
+  assert.equal(yFor({ position: "bottom" }), "h-text_h-h*0.1");
+
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts,
+    overlayText: { ...overlay, position: "center", fontsize: 96, color: "0xFFCC00", box: false },
+  }, true);
+  const vf = argv[argv.indexOf("-vf") + 1]!;
+  assert.ok(vf.includes("fontsize=96"), vf);
+  assert.ok(vf.includes("fontcolor=0xFFCC00"), vf);
+  assert.ok(!vf.includes("box="), vf);
+  assert.ok(vf.includes("x=(w-text_w)/2"), vf);
 });

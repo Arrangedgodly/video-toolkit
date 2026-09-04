@@ -6,6 +6,7 @@ import { EditPlan, schemaIssues, type EditPlan as EditPlanType } from "../core/s
 import { compileTimeline, totalDuration, type Segment } from "../core/timeline.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 import type { MediaInfo } from "../media/ffprobe.js";
+import { OVERLAY_FONT_FILE } from "../media/ffmpeg.js";
 
 export interface ValidationIssue {
   code: string;
@@ -95,6 +96,7 @@ export async function validatePlan(
       op.type === "resize" ||
       op.type === "volume" ||
       op.type === "captions" ||
+      op.type === "overlay-text" ||
       op.type === "audio-mix"
     ) {
       const first = seenTransforms.get(op.type);
@@ -129,6 +131,26 @@ export async function validatePlan(
           });
         }
       }
+      if (op.type === "overlay-text") {
+        if (op.from !== undefined && op.to !== undefined && op.from >= op.to) {
+          errors.push({
+            code: "RANGE_NEGATIVE",
+            operation: i + 1,
+            message: `overlay-text: from (${op.from}) must be before to (${op.to})`,
+          });
+        }
+        // the font is a machine fact, not plan data — but the failure must be
+        // machine-readable before render spends an ffmpeg pass on it
+        try {
+          await stat(OVERLAY_FONT_FILE);
+        } catch {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: i + 1,
+            message: `overlay-text: font file not found: ${OVERLAY_FONT_FILE}`,
+          });
+        }
+      }
       if (op.type === "audio-mix") {
         try {
           await stat(op.file);
@@ -147,14 +169,26 @@ export async function validatePlan(
     (op): op is Extract<(typeof plan.operations)[number], { type: "captions" }> =>
       op.type === "captions",
   );
-  if (captionsOp && errors.length === 0) {
+  const overlayTextOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "overlay-text" }> =>
+      op.type === "overlay-text",
+  );
+  if ((captionsOp || overlayTextOp) && errors.length === 0) {
     const { hasFilter } = await import("../media/ffmpeg.js");
-    if (!(await hasFilter("subtitles"))) {
+    if (captionsOp && !(await hasFilter("subtitles"))) {
       errors.push({
         code: "OPERATION_INVALID",
         operation: plan.operations.indexOf(captionsOp) + 1,
         message:
           "captions: this ffmpeg build lacks the 'subtitles' filter (libass); install a full build and retry",
+      });
+    }
+    if (overlayTextOp && !(await hasFilter("drawtext"))) {
+      errors.push({
+        code: "OPERATION_INVALID",
+        operation: plan.operations.indexOf(overlayTextOp) + 1,
+        message:
+          "overlay-text: this ffmpeg build lacks the 'drawtext' filter (freetype); install a full build and retry",
       });
     }
   }
@@ -171,6 +205,26 @@ export async function validatePlan(
       return { ...report, valid: false };
     }
     throw e;
+  }
+
+  // overlay-text `to` lives on the OUTPUT timeline — bound it by the expected
+  // output duration (timeline / speed; the same canonical expectation the
+  // render progress/verify stages use)
+  if (overlayTextOp && overlayTextOp.to !== undefined) {
+    const speedOp = plan.operations.find(
+      (op): op is Extract<(typeof plan.operations)[number], { type: "speed" }> =>
+        op.type === "speed",
+    );
+    const expectedOutput = speedOp
+      ? (report.timelineDuration ?? 0) / speedOp.factor
+      : report.timelineDuration ?? 0;
+    if (overlayTextOp.to > expectedOutput + DURATION_TOLERANCE) {
+      errors.push({
+        code: "OPERATION_INVALID",
+        operation: plan.operations.indexOf(overlayTextOp) + 1,
+        message: `overlay-text: to (${overlayTextOp.to}) exceeds expected output duration ${expectedOutput.toFixed(3)}s`,
+      });
+    }
   }
 
   // output path sanity

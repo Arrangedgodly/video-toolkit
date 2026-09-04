@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runCapture, inspectFile } from "../media/ffprobe.js";
@@ -11,6 +11,7 @@ const FIXTURE = "fixture.mp4"; // 12s, 1280x720, 440Hz tone
 const SPEECH = "speech-gated.mp4"; // 12s, 3kHz bursts: 2.5s on / 1.5s off
 const BED = "bed.mp3"; // 5s, 200Hz stereo 48kHz mp3 (shorter + rate/layout-mismatched)
 const NOAUDIO = "noaudio.mp4"; // 3s video-only
+const BLACK = "black.mp4"; // 2s solid black, video-only — overlay visibility probe
 let dir = "";
 
 before(async () => {
@@ -49,6 +50,14 @@ before(async () => {
     "-t", "3", "-c:v", "libx264", "-crf", "30", "-pix_fmt", "yuv420p", "-an", NOAUDIO,
   ]);
   assert.equal(r4.code, 0, r4.stderr);
+
+  // solid black: burned text is the ONLY source of luminance in a decoded frame
+  const r5 = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=black:s=640x360:rate=25",
+    "-t", "2", "-c:v", "libx264", "-crf", "30", "-pix_fmt", "yuv420p", "-an", BLACK,
+  ]);
+  assert.equal(r5.code, 0, r5.stderr);
 });
 
 after(async () => {
@@ -284,4 +293,125 @@ test("preview honors audio-mix identically (same graph, preview settings, op def
   const bIdx = r.command.indexOf("-b:a");
   assert.equal(r.command[bIdx + 1], "96k"); // preview audio bitrate
   assert.ok(Math.abs(r.outputDuration - 4) < 0.3);
+});
+
+// ---- overlay-text (ONE drawtext burned in the same single pass)
+
+/** brightest luma byte of a decoded frame — a text-presence probe on the
+ * solid-black fixture (text on => >200; pure black => ~0 after the limited->
+ * full-range gray conversion). */
+async function maxLuma(file: string, t: number): Promise<number> {
+  const r = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-ss", String(t), "-i", file,
+    "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "luma.raw",
+  ]);
+  assert.equal(r.code, 0, r.stderr);
+  const buf = await readFile("luma.raw");
+  let m = 0;
+  for (const b of buf) if (b > m) m = b;
+  return m;
+}
+
+test("overlay-text burns in the same pass; visible only in its window; duration unchanged", async () => {
+  // hostile text (apostrophe, colon, percent, comma) rides the real render —
+  // the escaping unit tests pin the exact emitted filter string
+  const p = await writePlan("o1.json", {
+    version: 1,
+    source: BLACK,
+    operations: [
+      { type: "trim", start: 0, end: 2 },
+      { type: "overlay-text", text: "It's 100% done: part, two", from: 0.5, to: 1.5 },
+    ],
+    output: { path: "o1.mp4" },
+  });
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+
+  const r = await renderPlan(p);
+  // INVARIANT 1: exactly ONE ffmpeg invocation, one input, no complex graph
+  assert.equal(r.command[0], "ffmpeg");
+  assert.equal(r.command.filter((a) => a === "-i").length, 1);
+  assert.equal(r.command.includes("-filter_complex"), false);
+  const cmd = r.command.join(" ");
+  assert.ok(cmd.includes("drawtext="), cmd);
+  assert.ok(cmd.includes("enable='between(t,0.500,1.500)'"), cmd);
+  assert.ok(cmd.includes("expansion=none"), cmd);
+  assert.ok(cmd.includes("fontfile=/System/Library/Fonts/Helvetica.ttc"), cmd);
+
+  // window semantics: text is the only luminance on solid black
+  const inside = await maxLuma(r.output, 1.0);
+  const outside = await maxLuma(r.output, 0.2);
+  assert.ok(inside > 200, `text visible inside the window: max luma ${inside}`);
+  assert.ok(outside < 40, `no text outside the window: max luma ${outside}`);
+
+  // duration unchanged vs a no-overlay control; encodes differ (text on frames)
+  assert.ok(Math.abs(r.outputDuration - 2) < 0.3, `duration ${r.outputDuration}`);
+  const control = await writePlan("o1c.json", {
+    version: 1,
+    source: BLACK,
+    operations: [{ type: "trim", start: 0, end: 2 }],
+    output: { path: "o1c.mp4" },
+  });
+  const rc = await renderPlan(control);
+  assert.ok(Math.abs(rc.outputDuration - r.outputDuration) < 0.05);
+  const [a, b] = await Promise.all([readFile(r.output), readFile(rc.output)]);
+  assert.ok(!a.equals(b), "overlay and control encodes are byte-identical");
+
+  // preview parity: same drawtext, preview scale settings
+  const pv = await renderPlan(p, { mode: "preview", force: true });
+  assert.ok(pv.output.endsWith("o1.preview.mp4"), pv.output);
+  const pvc = pv.command.join(" ");
+  assert.ok(pvc.includes("drawtext="), pvc);
+  assert.ok(pvc.includes("scale=640:-2"), pvc);
+  assert.ok(Math.abs(pv.outputDuration - 2) < 0.3);
+});
+
+test("overlay-text validation: from<to, output-duration bounds (speed-aware), duplicates", async () => {
+  // from >= to
+  const r1 = await validatePlan(await writePlan("ov1.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "overlay-text", text: "x", from: 3, to: 3 },
+  ])));
+  assert.equal(r1.valid, false);
+  assert.equal(r1.errors[0]?.code, "RANGE_NEGATIVE");
+  assert.equal(r1.errors[0]?.operation, 2);
+
+  // to beyond the timeline (fixture is 12s)
+  const r2 = await validatePlan(await writePlan("ov2.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "overlay-text", text: "x", to: 13 },
+  ])));
+  assert.equal(r2.valid, false);
+  assert.equal(r2.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(r2.errors[0]?.message.includes("exceeds expected output duration"));
+
+  // speed-aware bound: timeline 12 at 2x -> expected output 6s
+  const r3 = await validatePlan(await writePlan("ov3.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "overlay-text", text: "x", to: 6.5 },
+  ])));
+  assert.equal(r3.valid, false);
+  assert.equal(r3.errors[0]?.code, "OPERATION_INVALID");
+  const r4 = await validatePlan(await writePlan("ov4.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "overlay-text", text: "x", to: 5.9 },
+  ])));
+  assert.equal(r4.valid, true, JSON.stringify(r4.errors));
+
+  // duplicate op; render of it throws the code
+  const r5 = await validatePlan(await writePlan("ov5.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "overlay-text", text: "a" },
+    { type: "overlay-text", text: "b" },
+  ])));
+  assert.equal(r5.valid, false);
+  assert.equal(r5.errors[0]?.code, "OPERATION_INVALID");
+  assert.equal(r5.errors[0]?.operation, 3);
+  await assert.rejects(
+    () => renderPlan("ov5.json"),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
 });

@@ -2,7 +2,7 @@
 
 Format rules for this file: DOC-CONVENTIONS (bottom). Updating behavior anywhere in src/ obligates updating the matching table here in the same change — see EXTENSION RULES.
 
-STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 review-frames + transcribe concurrency, M9 VTT + ship gate) · 185 tests (`npm test`, ~26 s; transcription tests skip without an engine) · binary `video` on PATH (npm link) · node ≥ 20, ffmpeg/ffprobe required.
+STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 review-frames + transcribe concurrency, M9 VTT + ship gate) · 193 tests (`npm test`, ~33 s; transcription tests skip without an engine) · binary `video` on PATH (npm link) · node ≥ 20, ffmpeg/ffprobe required.
 
 ## GLOSSARY (canonical terms — never synonymize)
 
@@ -11,7 +11,7 @@ STATUS: milestones M1–M9 complete (M6 bridges, M7 audio-mix single-pass, M8 re
 - **worker** — deterministic analysis producing an observation (detect-silence, detect-scenes, transcribe, detect-filler).
 - **bridge** — deterministic observation→plan expansion (`plan --cuts-from`).
 - **timeline op** — `trim`/`cut`: absolute source-time ranges; order-independent; trims union, cuts subtract.
-- **transform op** — `speed`/`resize`/`volume`/`normalize-audio`/`audio-mix`: global, ≤ 1 each per plan.
+- **transform op** — `speed`/`resize`/`volume`/`normalize-audio`/`audio-mix`/`overlay-text`: global, ≤ 1 each per plan.
 - **engine** — swappable transcription backend behind one interface (`src/analysis/transcribe/engines.ts`).
 - **preview** — cheap render to `<output>.preview.mp4` (640 w, ultrafast, CRF 30); can never touch the final path.
 - **source-id** — cache key = sha1(absPath|size|mtimeMs); changed file ⇒ new id, no invalidation logic.
@@ -65,6 +65,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | `volume` | `db` XOR `factor` | global; factor→dB = 20·log₁₀(f) |
 | `normalize-audio` | `target?` (LUFS, default −16) | single-pass loudnorm |
 | `captions` | `file`, `style?` (ASS force_style) | burns .srt in the same pass. **CUE TIMES ARE OUTPUT-TIMELINE**: source-timed srt must be remapped first via `video captions --plan` (cues spanning cuts split; fragments <0.3 s drop) |
+| `overlay-text` | `text` (literal, ≤1024 chars) · `from?`/`to?` (s, OUTPUT-timeline visibility window; both absent = always visible) · `position? top\|center\|bottom` (default `bottom`) · `fontsize?` (px, int 1–512, default 48) · `color?` (name or `0xRRGGBB[AA]`, default `white`) · `box?` (default `true` → `box=1:boxcolor=black@0.5:boxborderw=12`) | ONE drawtext burned in the SAME pass, after scale+subtitles (fontsize in output px; x centered `(w-text_w)/2`; y top `h*0.1` / center `(h-text_h)/2` / bottom `h-text_h-h*0.1`). Text is LITERAL: drawtext crosses TWO unescaping stages (filtergraph + option-value tokenizer) → own escaping (`\`×4, `'`×3, `:`×2, `,;[]`×1; `%` raw under `expansion=none`), unit-proved pixel-identical vs `textfile=` ground truth. Font FIXED `/System/Library/Fonts/Helvetica.ttc` (font or `drawtext` filter missing → `OPERATION_INVALID`); `from ≥ to` → `RANGE_NEGATIVE`; `to` > expected output duration (timeline/speed) → `OPERATION_INVALID` |
 | `audio-mix` | `file` (music bed, required) · `level?` (dB, −60…0, default −18) · `duck?{threshold?, ratio?, attack?, release?, makeup?}` — `threshold` is LINEAR amplitude 0.000976563–1 (default 0.02 ≈ −34 dB; NOT dB), `ratio` 1–20 (default 8, ≈18 dB measured depth), `attack`/`release` ms (defaults 20/400), `makeup` 1–64 | music bed mixed under the plan audio with speech-keyed sidechain ducking, in the SAME single pass (bed is a `-stream_loop` 2nd input, loops and trims to the timeline, conforms to the speech's own rate/layout; `amix duration=first` natural end — no `-shortest`); bed missing → `MIX_INPUT_NOT_FOUND`; source without audio → `NO_AUDIO_STREAM` warning and the op is a no-op |
 
 Rules: ops order-independent · ≤1 of each transform · renders are ONE ffmpeg pass (select-based multi-range) · preview path ≠ final path · `--force` required to overwrite explicit outputs · source can never be an output.
@@ -86,7 +87,8 @@ Zod source of truth: `src/core/schemas.ts`. Shapes: SilenceReport `{segments:[{s
 
 ## ENVIRONMENT FACTS (this machine; re-run `video diagnose` to confirm)
 
-- ffmpeg 9.0.1 **ffmpeg-full** (libass + freetype present → burned captions work; `subtitles`/`drawtext` filters available) via `brew unlink ffmpeg && brew link --force ffmpeg-full` (ffmpeg-full is keg-only; reverse with unlink ffmpeg-full + link ffmpeg; scrcpy keeps working — full build is a functional superset). videotoolbox hwaccel + h264/hevc encoders present.
+- ffmpeg 9.0.1 **ffmpeg-full** (libass + freetype present → burned captions + overlay-text work; `subtitles`/`drawtext` filters available) via `brew unlink ffmpeg && brew link --force ffmpeg-full` (ffmpeg-full is keg-only; reverse with unlink ffmpeg-full + link ffmpeg; scrcpy keeps working — full build is a functional superset). videotoolbox hwaccel + h264/hevc encoders present.
+- `overlay-text` font is FIXED: `/System/Library/Fonts/Helvetica.ttc` — verified present and rendering with this build's freetype (the op's ONE deterministic font rule; missing → `OPERATION_INVALID`).
 - Note: the full 9.0.1 bottle renders ~2–3× slower than the old minimal 8.1.2 did (verified in test timings); benchmark cache is keyed by ffmpeg version so `video benchmark` re-measures after upgrades.
 - Apple M2, 8 cores, 16 GB. Re-run `video benchmark <input>` for current per-source recommendations.
 
