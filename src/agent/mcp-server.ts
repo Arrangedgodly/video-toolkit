@@ -7,6 +7,7 @@ import { cachedInspect } from "../cache/cache.js";
 import { scaffoldPlanObject } from "../core/scaffold.js";
 import { validatePlan } from "../validate/validate.js";
 import { renderPlan } from "../render/render.js";
+import { renderBatch } from "../render/batch.js";
 import { diagnose } from "../hardware/diagnose.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
 import { catalogTransitions } from "../media/transitions.js";
@@ -125,6 +126,20 @@ const TOOLS: ToolDef[] = [
         encoder: { type: "string", enum: ["libx264", "h264_videotoolbox"] },
       },
       required: ["plan"],
+    },
+  },
+  {
+    name: "video_render_batch",
+    description:
+      "Render multiple plans with bounded parallelism. plans = plan file paths, directories (the *.json files directly inside, non-recursive, sorted), or * globs. A failing/invalid plan is REPORTED in results[]/summary.failures — the batch always runs to completion, and per-plan failures never set isError (only a batch-level error such as invalid jobs does). jobs default = the FIRST plan's source cached benchmark renderConcurrency recommendation when an integer in 1..4, else 1. force passes through to every render (each render's own overwrite guards stay intact). Payload = CLI stdout shape; exit-code semantics are the CLI's (0 iff all succeeded).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        plans: { type: "array", items: str },
+        jobs: { type: "number" },
+        force: { type: "boolean" },
+      },
+      required: ["plans"],
     },
   },
   {
@@ -312,6 +327,14 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
         force: a.force === true,
         encoder: a.encoder as EncoderId | undefined,
       });
+    case "video_render_batch":
+      return renderBatch(
+        Array.isArray(a.plans) ? a.plans.map((p) => String(p)) : [],
+        {
+          jobs: a.jobs as number | undefined,
+          force: a.force === true,
+        },
+      );
     case "video_detect_silence":
       return detectSilence(String(a.input), {
         thresholdDb: (a.threshold_db as number | undefined) ?? 35,

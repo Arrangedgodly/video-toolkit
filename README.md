@@ -45,6 +45,9 @@ video plan <input>         scaffold a valid edit plan for the source
 video validate <plan>      check a plan; machine-readable errors
 video preview <plan>       cheap preview render (<output>.preview.mp4)
 video render <plan>        final render from the validated plan
+video render-batch <plans...>  render many plans with bounded parallelism
+                           (files, directories, or * globs; failing plans are
+                           reported, the batch continues)
 video diagnose             environment + ffmpeg capabilities (JSON)
 video benchmark <input>    measure fastest encoder/concurrency on this machine
 video transitions          crossfade kinds on this ffmpeg build (JSON)
@@ -123,7 +126,7 @@ Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operatio
 2. **Plan** — turn observations into ops: scaffold with `video plan`, pre-fill via a bridge (`--cuts-from`, `--highlights-from`), then prune and tune by judgment — that part is yours.
 3. **Validate** — `video validate` until `valid: true`; branch on the error `code` to fix problems programmatically.
 4. **Preview** — `video preview` writes `<output>.preview.mp4` (640w, ultrafast, CRF 30), so iterating can never clobber the final. Inspect the result with `extract-frame`/`review-frames` and loop back to the plan.
-5. **Render** — `video render`, once, when the plan is approved: one pass, final settings (CRF 18, `medium`, AAC 192k). `--force` is required to overwrite an existing output, and the source can never be an output. `--encoder libx264|h264_videotoolbox` overrides the codec choice; `video benchmark <input>` measures which is fastest on your machine.
+5. **Render** — `video render`, once, when the plan is approved: one pass, final settings (CRF 18, `medium`, AAC 192k). `--force` is required to overwrite an existing output, and the source can never be an output. `--encoder libx264|h264_videotoolbox` overrides the codec choice; `video benchmark <input>` measures which is fastest on your machine. Many plans at once: `video render-batch <plans...>` renders plan files, directories (`*.json` inside), or `*` globs with bounded parallelism (`--jobs N`, default = the first plan's source benchmark concurrency recommendation) — an invalid or failing plan is reported in the per-plan results and the batch always runs to completion (exit 0 only if every plan succeeded).
 
 ## Errors
 

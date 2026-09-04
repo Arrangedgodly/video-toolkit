@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import path from "node:path";
 import { cachedInspect } from "../cache/cache.js";
 import { ToolError } from "../core/errors.js";
 import { scaffoldPlanObject } from "../core/scaffold.js";
 import type { EncoderId } from "../media/ffmpeg.js";
 import { renderPlan } from "../render/render.js";
+import { renderBatch } from "../render/batch.js";
 import { validatePlan } from "../validate/validate.js";
 import { diagnose } from "../hardware/diagnose.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
@@ -30,6 +32,11 @@ commands:
   validate <plan>            check a plan; machine-readable errors (JSON)
   preview <plan>             cheap preview render (<output>.preview.mp4)
   render <plan>              final render from the validated plan
+  render-batch <plans...>    render many plans with bounded parallelism
+                             (plan files, directories, or * globs; a failing
+                             plan is reported and the batch continues —
+                             summary + per-plan results, exit 0 iff all
+                             succeeded) [--jobs N] [--force]
   diagnose                   environment + ffmpeg capabilities (JSON)
   benchmark <input>          measure fastest encoder/concurrency on this machine
   transitions                crossfade kinds on this ffmpeg build (JSON;
@@ -73,12 +80,18 @@ plan operations: trim (keep range), cut (remove range), normalize-audio,
   audio-mix (file, level dB, duck{threshold LINEAR, ratio, attack ms, release ms}),
   overlay-text (text; output-timeline window from/to; position top|center|bottom;
   fontsize, color, box),
+  image-overlay (file; png watermark/logo at top-left|top-right|bottom-left|
+  bottom-right|center; width keeps aspect, opacity, output-timeline window
+  from/to),
   export-gif (terminal, last op; width, fps, output-timeline window from/to;
   output.path must end .gif; audio dropped);
   transform ops are global — at most one of each per plan.
 
-flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_videotoolbox>
-       --mode <final|preview>(render)  --seconds N(benchmark)
+flags: --pretty  --debug  --no-cache  --force(render, render-batch)
+       --encoder <libx264|h264_videotoolbox> --mode <final|preview>(render)
+       --seconds N(benchmark) --jobs N(render-batch; default = the cached
+       benchmark renderConcurrency for the first plan's source, clamped 1..4,
+       else 1)
        plan: --cuts-from <silence.json|filler.json> (one bridge per invocation;
              silence: [--min-duration s=0.5] [--pad s=0.25];
              filler: [--filler-pad-before s=0.10] [--filler-pad-end s=0.25])
@@ -126,6 +139,7 @@ interface CliFlags {
   port?: number;
   host?: string;
   token?: string;
+  jobs?: number;
 }
 
 function parseArgs(argv: string[]): CliFlags {
@@ -177,6 +191,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--port") f.port = Number(argv[++i]);
     else if (a === "--host") f.host = argv[++i];
     else if (a === "--token") f.token = argv[++i];
+    else if (a === "--jobs") f.jobs = Number(argv[++i]);
     else if (a === "-h" || a === "--help") f.help = true;
     else f.positional.push(a);
   }
@@ -281,6 +296,27 @@ async function main(): Promise<void> {
     }
     case "diagnose": {
       emit(f, await diagnose());
+      return;
+    }
+    case "render-batch": {
+      // every positional is a plan arg (file, directory, or * glob)
+      if (f.positional.length === 0) {
+        throw new ToolError(
+          "PLAN_SCHEMA_INVALID",
+          "usage: video render-batch <plans...> (plan files, directories, or * globs)",
+        );
+      }
+      const report = await renderBatch(f.positional, {
+        jobs: f.jobs,
+        force: f.force,
+        noCache: f.noCache,
+        debug: debugLine(f),
+        onPlanStart: (i, n, p) => {
+          process.stderr.write(`render-batch [${i + 1}/${n}] ${path.basename(p)}\n`);
+        },
+      });
+      emit(f, report);
+      process.exitCode = report.summary.failed === 0 ? 0 : 1;
       return;
     }
     case "transitions": {
