@@ -1,12 +1,13 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { runCapture } from "../media/ffprobe.js";
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
+const SERVER = path.resolve(import.meta.dirname, "..", "agent", "mcp-server.js");
 let dir = "";
 let child: ReturnType<typeof spawn> | null = null;
 const responses = new Map<number, unknown>();
@@ -48,8 +49,7 @@ before(async () => {
   ]);
   assert.equal(r.code, 0, r.stderr);
 
-  const server = path.resolve(import.meta.dirname, "..", "agent", "mcp-server.js");
-  child = spawn(process.execPath, [server], { stdio: ["pipe", "pipe", "ignore"] });
+  child = spawn(process.execPath, [SERVER], { stdio: ["pipe", "pipe", "ignore"] });
   const buf: string[] = [];
   let pending = "";
   child.stdout!.on("data", (d: Buffer) => {
@@ -148,4 +148,41 @@ test("tools/call: unknown tool returns isError with a payload", async () => {
   assert.equal(result.isError, true);
   const payload = JSON.parse(result.content[0]!.text) as { error: { code: string } };
   assert.equal(payload.error.code, "OPERATION_INVALID");
+});
+
+test("bin-style invocation (argv[1] not ending in mcp-server.js) starts the server", async () => {
+  // Reproduces how the npm bin runs the server: a symlink named `video-mcp`
+  // -> dist/agent/mcp-server.js, so argv[1] does NOT end in "mcp-server.js".
+  // The startup guard must resolve real paths on both sides, or the process
+  // silently exits without ever answering `initialize`.
+  const binLink = path.join(dir, "video-mcp");
+  await symlink(SERVER, binLink);
+  const proc = spawn(process.execPath, [binLink], { stdio: ["pipe", "pipe", "ignore"] });
+  try {
+    const line = await new Promise<string>((resolve, reject) => {
+      const fail = setTimeout(() => reject(new Error("no response to initialize — server did not start")), 15000);
+      let pending = "";
+      proc.stdout!.setEncoding("utf8");
+      proc.stdout!.on("data", (d: string) => {
+        pending += d;
+        const nl = pending.indexOf("\n");
+        if (nl >= 0) {
+          clearTimeout(fail);
+          resolve(pending.slice(0, nl));
+        }
+      });
+      proc.on("exit", (code) => {
+        clearTimeout(fail);
+        reject(new Error(`server exited before responding (code ${code})`));
+      });
+      proc.stdin!.write(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } }) + "\n",
+      );
+    });
+    const msg = JSON.parse(line) as { result?: { serverInfo?: { name: string } } };
+    assert.equal(msg.result?.serverInfo?.name, "video-toolkit");
+  } finally {
+    proc.kill();
+    await rm(binLink, { force: true });
+  }
 });

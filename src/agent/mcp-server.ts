@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import readline from "node:readline";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { EncoderId } from "../media/ffmpeg.js";
 import { cachedInspect } from "../cache/cache.js";
 import { scaffoldPlanObject } from "../core/scaffold.js";
@@ -400,6 +402,20 @@ export function startStdioServer(): void {
   });
 }
 
-if (process.argv[1]?.endsWith("mcp-server.js")) {
+// Auto-start only when this file is the executed entry point — direct
+// (`node dist/agent/mcp-server.js`) or via the npm bin (`video-mcp`, a symlink
+// whose path does not end in "mcp-server.js"). Compare real paths on both
+// sides so the bin symlink resolves to this file. A plain import (the CLI's
+// `mcp` case) does not auto-start; it calls startStdioServer() itself.
+function invokedAsMain(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false; // argv[1] missing/unresolvable — treat as an import
+  }
+}
+
+if (invokedAsMain()) {
   startStdioServer();
 }
