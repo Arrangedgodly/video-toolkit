@@ -47,7 +47,8 @@ agent adapter:
   mcp                       MCP stdio server (JSON-RPC tools for MCP clients)
 
 plan operations: trim (keep range), cut (remove range), normalize-audio,
-  speed (factor), resize (width[, height]), volume (db|factor);
+  speed (factor), resize (width[, height]), volume (db|factor),
+  audio-mix (file, level dB, duck{threshold LINEAR, ratio, attack ms, release ms});
   transform ops are global — at most one of each per plan.
 
 flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_videotoolbox>

@@ -73,13 +73,15 @@ The plan is a declaration of **what to keep**, not a script: `trim` keeps a rang
     { "type": "normalize-audio", "target": -16 },
     { "type": "speed", "factor": 1.25 },
     { "type": "resize", "width": 1280 },
-    { "type": "volume", "db": -3 }
+    { "type": "volume", "db": -3 },
+    { "type": "audio-mix", "file": "bed.mp3", "level": -18,
+      "duck": { "threshold": 0.02, "ratio": 8, "attack": 20, "release": 400 } }
   ],
   "output": { "path": "output.mp4", "mode": "final" }
 ]
 ```
 
-Timeline ops (`trim`, `cut`) decide **which source ranges are kept**. Transform ops (`speed`, `resize`, `volume`, `normalize-audio`) apply to the whole output — at most one of each per plan — and compose into the same single render pass (audio follows speed via a clamped `atempo` chain; `volume` takes `db` or `factor`, exactly one).
+Timeline ops (`trim`, `cut`) decide **which source ranges are kept**. Transform ops (`speed`, `resize`, `volume`, `normalize-audio`, `audio-mix`) apply to the whole output — at most one of each per plan — and compose into the same single render pass (audio follows speed via a clamped `atempo` chain; `volume` takes `db` or `factor`, exactly one). `audio-mix` layers a music bed under the program with speech-keyed sidechain ducking: the bed loops and trims to the timeline, `level` is bed gain in dB (default −18), and `duck` tunes the compressor — note `threshold` is **linear** amplitude (default 0.02 ≈ −34 dB), while `attack`/`release` are milliseconds (defaults 20/400).
 
 Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operation type means one schema case plus one compiler/validator entry — the execution engine does not change. Timestamps are seconds, everywhere, in every layer.
 
@@ -104,7 +106,7 @@ Previews write `<output>.preview.mp4` so they can never clobber the final. The s
 {"valid":false,"errors":[{"code":"TIMESTAMP_OUT_OF_RANGE","operation":1,"message":"trim: range [0, 100] exceeds source duration 12.000s"}],"warnings":[],"timelineDuration":8}
 ```
 
-Codes: `PLAN_INVALID_JSON`, `PLAN_SCHEMA_INVALID`, `SOURCE_NOT_FOUND`, `TIMESTAMP_OUT_OF_RANGE`, `RANGE_NEGATIVE`, `EMPTY_TIMELINE`, `OUTPUT_PATH_INVALID`, `OUTPUT_WOULD_OVERWRITE_SOURCE`, `OUTPUT_EXISTS`, `FFMPEG_FAILED`, `FFMPEG_NOT_FOUND`, `FFPROBE_NOT_FOUND`, `UNSUPPORTED_MEDIA`. Render refuses to overwrite outputs without `--force` and can never overwrite the source.
+Codes: `PLAN_INVALID_JSON`, `PLAN_SCHEMA_INVALID`, `SOURCE_NOT_FOUND`, `TIMESTAMP_OUT_OF_RANGE`, `RANGE_NEGATIVE`, `EMPTY_TIMELINE`, `OUTPUT_PATH_INVALID`, `OUTPUT_WOULD_OVERWRITE_SOURCE`, `OUTPUT_EXISTS`, `MIX_INPUT_NOT_FOUND`, `FFMPEG_FAILED`, `FFMPEG_NOT_FOUND`, `FFPROBE_NOT_FOUND`, `UNSUPPORTED_MEDIA`. Render refuses to overwrite outputs without `--force` and can never overwrite the source.
 
 ## MCP server
 

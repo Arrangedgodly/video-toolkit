@@ -11,7 +11,7 @@ STATUS: milestone 5 complete · 99 tests (`npm test`, ~20 s; transcription tests
 - **worker** — deterministic analysis producing an observation (detect-silence, detect-scenes, transcribe, detect-filler).
 - **bridge** — deterministic observation→plan expansion (`plan --cuts-from`).
 - **timeline op** — `trim`/`cut`: absolute source-time ranges; order-independent; trims union, cuts subtract.
-- **transform op** — `speed`/`resize`/`volume`/`normalize-audio`: global, ≤ 1 each per plan.
+- **transform op** — `speed`/`resize`/`volume`/`normalize-audio`/`audio-mix`: global, ≤ 1 each per plan.
 - **engine** — swappable transcription backend behind one interface (`src/analysis/transcribe/engines.ts`).
 - **preview** — cheap render to `<output>.preview.mp4` (640 w, ultrafast, CRF 30); can never touch the final path.
 - **source-id** — cache key = sha1(absPath|size|mtimeMs); changed file ⇒ new id, no invalidation logic.
@@ -61,12 +61,13 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | `volume` | `db` XOR `factor` | global; factor→dB = 20·log₁₀(f) |
 | `normalize-audio` | `target?` (LUFS, default −16) | single-pass loudnorm |
 | `captions` | `file`, `style?` (ASS force_style) | burns .srt in the same pass. **CUE TIMES ARE OUTPUT-TIMELINE**: source-timed srt must be remapped first via `video captions --plan` (cues spanning cuts split; fragments <0.3 s drop) |
+| `audio-mix` | `file` (music bed, required) · `level?` (dB, −60…0, default −18) · `duck?{threshold?, ratio?, attack?, release?, makeup?}` — `threshold` is LINEAR amplitude 0.000976563–1 (default 0.02 ≈ −34 dB; NOT dB), `ratio` 1–20 (default 8, ≈18 dB measured depth), `attack`/`release` ms (defaults 20/400), `makeup` 1–64 | music bed mixed under the plan audio with speech-keyed sidechain ducking, in the SAME single pass (bed is a `-stream_loop` 2nd input, loops and trims to the timeline, conforms to the speech's own rate/layout; `amix duration=first` natural end — no `-shortest`); bed missing → `MIX_INPUT_NOT_FOUND`; source without audio → `NO_AUDIO_STREAM` warning and the op is a no-op |
 
 Rules: ops order-independent · ≤1 of each transform · renders are ONE ffmpeg pass (select-based multi-range) · preview path ≠ final path · `--force` required to overwrite explicit outputs · source can never be an output.
 
 ## ERROR CODES (branch on `code`, fix, retry)
 
-`PLAN_INVALID_JSON` plan not JSON · `PLAN_SCHEMA_INVALID` Zod fail (details.issues[]) · `SOURCE_NOT_FOUND` · `TIMESTAMP_OUT_OF_RANGE` op beyond source duration · `RANGE_NEGATIVE` start ≥ end · `EMPTY_TIMELINE` ops remove everything · `OPERATION_INVALID` duplicate transform / volume param / unknown MCP tool · `OUTPUT_PATH_INVALID` · `OUTPUT_WOULD_OVERWRITE_SOURCE` · `OUTPUT_EXISTS` (use --force) · `FFMPEG_FAILED` (details.command + stderrTail) · `FFMPEG_NOT_FOUND` · `FFPROBE_NOT_FOUND` · `UNSUPPORTED_MEDIA` · `OBSERVATION_INVALID` observation file unparsable · `TRANSCRIPTION_ENGINE_UNAVAILABLE` (details.probed[]) · `TRANSCRIPTION_ENGINE_FAILED`.
+`PLAN_INVALID_JSON` plan not JSON · `PLAN_SCHEMA_INVALID` Zod fail (details.issues[]) · `SOURCE_NOT_FOUND` · `TIMESTAMP_OUT_OF_RANGE` op beyond source duration · `RANGE_NEGATIVE` start ≥ end · `EMPTY_TIMELINE` ops remove everything · `OPERATION_INVALID` duplicate transform / volume param / unknown MCP tool · `MIX_INPUT_NOT_FOUND` audio-mix bed file missing (details: operation, path) · `OUTPUT_PATH_INVALID` · `OUTPUT_WOULD_OVERWRITE_SOURCE` · `OUTPUT_EXISTS` (use --force) · `FFMPEG_FAILED` (details.command + stderrTail) · `FFMPEG_NOT_FOUND` · `FFPROBE_NOT_FOUND` · `UNSUPPORTED_MEDIA` · `OBSERVATION_INVALID` observation file unparsable · `TRANSCRIPTION_ENGINE_UNAVAILABLE` (details.probed[]) · `TRANSCRIPTION_ENGINE_FAILED`.
 
 ## OBSERVATION SCHEMAS
 

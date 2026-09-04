@@ -59,3 +59,46 @@ test("normalize-audio target bounds enforced", () => {
     false,
   );
 });
+
+test("audio-mix parses minimal and full forms", () => {
+  const minimal = EditPlan.parse({ ...base, operations: [{ type: "audio-mix", file: "bed.mp3" }] });
+  assert.equal(minimal.operations[0]?.type, "audio-mix");
+
+  const full = EditPlan.parse({
+    ...base,
+    operations: [
+      {
+        type: "audio-mix",
+        file: "bed.mp3",
+        level: -18,
+        duck: { threshold: 0.02, ratio: 8, attack: 20, release: 400, makeup: 2 },
+      },
+    ],
+  });
+  assert.equal(full.operations.length, 1);
+});
+
+test("audio-mix bounds enforced: level dB, LINEAR threshold, duck ranges", () => {
+  const bad: unknown[] = [
+    { type: "audio-mix", file: "bed.mp3", level: 1 }, // > 0 dB
+    { type: "audio-mix", file: "bed.mp3", level: -61 },
+    { type: "audio-mix" }, // file is required
+    { type: "audio-mix", file: "bed.mp3", duck: { threshold: 0.00001 } }, // below 2^-10
+    { type: "audio-mix", file: "bed.mp3", duck: { threshold: 1.5 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { ratio: 0.5 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { ratio: 21 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { attack: 0.001 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { attack: 2001 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { release: 0.001 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { release: 9001 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { makeup: 0.5 } },
+    { type: "audio-mix", file: "bed.mp3", duck: { makeup: 65 } },
+  ];
+  for (const op of bad) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [op] }).success,
+      false,
+      `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+});

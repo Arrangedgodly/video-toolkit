@@ -90,7 +90,13 @@ export async function validatePlan(
         });
       }
     }
-    if (op.type === "speed" || op.type === "resize" || op.type === "volume" || op.type === "captions") {
+    if (
+      op.type === "speed" ||
+      op.type === "resize" ||
+      op.type === "volume" ||
+      op.type === "captions" ||
+      op.type === "audio-mix"
+    ) {
       const first = seenTransforms.get(op.type);
       if (first !== undefined) {
         errors.push({
@@ -120,6 +126,18 @@ export async function validatePlan(
             code: "OPERATION_INVALID",
             operation: i + 1,
             message: `captions: subtitle file not found: ${op.file}`,
+          });
+        }
+      }
+      if (op.type === "audio-mix") {
+        try {
+          await stat(op.file);
+        } catch {
+          errors.push({
+            code: "MIX_INPUT_NOT_FOUND",
+            operation: i + 1,
+            path: op.file,
+            message: `audio-mix: bed file not found: ${op.file}`,
           });
         }
       }
@@ -187,7 +205,7 @@ export async function validatePlan(
   if (!media.audio) {
     const audioOps = plan.operations
       .map((op, i) => ({ op, i: i + 1 }))
-      .filter(({ op }) => op.type === "normalize-audio" || op.type === "volume");
+      .filter(({ op }) => op.type === "normalize-audio" || op.type === "volume" || op.type === "audio-mix");
     if (audioOps.length > 0) {
       warnings.push({
         code: "NO_AUDIO_STREAM",

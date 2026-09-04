@@ -1,7 +1,7 @@
 import path from "node:path";
 import { stat } from "node:fs/promises";
 import { ToolError, fail, type ErrorCode } from "../core/errors.js";
-import { buildRenderCommand, runFFmpeg, type EncoderId } from "../media/ffmpeg.js";
+import { buildRenderCommand, channelLayoutFor, runFFmpeg, type EncoderId, type MixOptions } from "../media/ffmpeg.js";
 import { inspectFile } from "../media/ffprobe.js";
 import { validatePlan } from "../validate/validate.js";
 import type { CacheOpts } from "../cache/cache.js";
@@ -44,6 +44,7 @@ const VALIDATION_CODES: ErrorCode[] = [
   "OUTPUT_PATH_INVALID",
   "OUTPUT_WOULD_OVERWRITE_SOURCE",
   "OPERATION_INVALID",
+  "MIX_INPUT_NOT_FOUND",
 ];
 
 /** preview output lives beside the final path and can never clobber it */
@@ -108,6 +109,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     (op): op is Extract<(typeof plan.operations)[number], { type: "captions" }> =>
       op.type === "captions",
   );
+  const audioMixOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
+      op.type === "audio-mix",
+  );
   const hasAudio = report.media.audio != null;
   const speedFactor = speedOp?.factor;
 
@@ -121,6 +126,36 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     if (scaleHeight === undefined && settings.scaleWidth !== undefined) {
       scaleWidth = Math.min(resizeOp.width, settings.scaleWidth);
     }
+  }
+
+  // expected output duration = timeline / speed; the mix bed's atrim bound
+  // needs it before the command is built (R1 record: atrim is the determinism
+  // bound on the looped bed)
+  const expectedDuration = speedFactor
+    ? report.timelineDuration / speedFactor
+    : report.timelineDuration;
+
+  // mix plumbing is pure declaration: bed file + level + duck params, the
+  // atrim bound, and the speech stream's OWN rate/layout from the already-
+  // probed media info — the bed conforms to the speech, never the reverse,
+  // and no new probes happen (defaults per R1's committed parameter table)
+  let mix: MixOptions | null = null;
+  if (audioMixOp && hasAudio && report.media.audio) {
+    const audio = report.media.audio;
+    mix = {
+      bedFile: audioMixOp.file,
+      levelDb: audioMixOp.level ?? -18,
+      duck: {
+        threshold: audioMixOp.duck?.threshold ?? 0.02,
+        ratio: audioMixOp.duck?.ratio ?? 8,
+        attack: audioMixOp.duck?.attack ?? 20,
+        release: audioMixOp.duck?.release ?? 400,
+        makeup: audioMixOp.duck?.makeup,
+      },
+      bedTrimSeconds: expectedDuration,
+      speechSampleRate: audio.sampleRate,
+      speechLayout: channelLayoutFor(audio.channels),
+    };
   }
 
   const command = buildRenderCommand(
@@ -145,12 +180,12 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
           : null,
       subtitleFile: captionsOp?.file,
       subtitleStyle: captionsOp?.style,
+      mix,
     },
     hasAudio,
   );
   debug(`command: ${command.join(" ")}`);
 
-  const expectedDuration = speedFactor ? report.timelineDuration / speedFactor : report.timelineDuration;
   const run = await runFFmpeg(command.slice(1), {
     expectedDuration,
     onProgress: opts.onProgress,

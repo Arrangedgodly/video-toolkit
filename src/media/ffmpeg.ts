@@ -44,6 +44,53 @@ export interface RenderOptions {
   /** burn this .srt during the same pass (output-timeline cue times) */
   subtitleFile?: string;
   subtitleStyle?: string;
+  /** when set (and the source has audio), mix a music bed under the program
+   * audio with speech-keyed sidechain ducking — still one ffmpeg pass
+   * (graph validated in docs/ultron/research/r1-audio-mix-single-pass.md) */
+  mix?: MixOptions | null;
+}
+
+export interface MixDuckOptions {
+  /** sidechaincompress threshold — LINEAR amplitude, NOT dB */
+  threshold: number;
+  ratio: number;
+  /** ms */
+  attack: number;
+  /** ms */
+  release: number;
+  /** optional post-compression gain; undefined → filter default (1) */
+  makeup?: number;
+}
+
+export interface MixOptions {
+  /** music bed; added as `-stream_loop -1 -i <bedFile>` (loops, then atrim) */
+  bedFile: string;
+  /** bed gain in dB applied before ducking */
+  levelDb: number;
+  duck: MixDuckOptions;
+  /** atrim bound for the looped bed = expected output duration (timeline /
+   * speed); a determinism bound, not a hang fix */
+  bedTrimSeconds: number;
+  /** speech stream's own sample rate — the BED conforms to the SPEECH */
+  speechSampleRate: number;
+  /** speech channel layout ("mono"|"stereo"|…); undefined = negotiate */
+  speechLayout?: string;
+}
+
+/** ffmpeg channel-layout name for a channel count (speech-side conform
+ * target for the mix bed); undefined leaves layout negotiation to ffmpeg. */
+export function channelLayoutFor(channels: number): string | undefined {
+  switch (channels) {
+    case 1: return "mono";
+    case 2: return "stereo";
+    case 3: return "2.1";
+    case 4: return "quad";
+    case 5: return "5.0";
+    case 6: return "5.1";
+    case 7: return "6.1";
+    case 8: return "7.1";
+    default: return undefined;
+  }
 }
 
 /** atempo is valid per-instance in [0.5, 2.0]; chain instances for any factor.
@@ -67,11 +114,70 @@ function trimNum(n: number): string {
   return String(Math.round(n * 10000) / 10000);
 }
 
+/** Duck params keep up to 9 decimals: threshold's minimum (2^-10 =
+ * 0.000976563) must survive formatting untouched. */
+function preciseNum(n: number): string {
+  return String(Math.round(n * 1e9) / 1e9);
+}
+
+/** Single-pass sidechain-ducking audio graph (validated verbatim in
+ * docs/ultron/research/r1-audio-mix-single-pass.md, run A):
+ * speech selects/retimes like the -af path, then splits into sidechain key
+ * + program; the bed loops, conforms to the speech's own rate/layout, takes
+ * its level, and ducks against the key; amix keeps the speech native
+ * (normalize=0) and ends at the speech EOF (duration=first). Global
+ * transforms (loudnorm, volume) act on the final program, after the mix. */
+function buildMixFilterGraph(
+  expr: string,
+  mix: MixOptions,
+  opts: RenderOptions,
+  speed?: number,
+): string {
+  const speech = [
+    `aselect='${expr}'`,
+    "asetpts=N/SR/TB",
+    ...(speed ? [atempoChain(speed)] : []),
+    ...(mix.speechLayout ? [`aformat=channel_layouts=${mix.speechLayout}`] : []),
+  ].join(",");
+  const bed = [
+    `aformat=sample_fmts=fltp:sample_rates=${mix.speechSampleRate}` +
+      (mix.speechLayout ? `:channel_layouts=${mix.speechLayout}` : ""),
+    `volume=${trimNum(mix.levelDb)}dB`,
+    "asetpts=N/SR/TB",
+    `atrim=duration=${trimNum(mix.bedTrimSeconds)}`,
+  ].join(",");
+  const sidechain =
+    `sidechaincompress=threshold=${preciseNum(mix.duck.threshold)}` +
+    `:ratio=${preciseNum(mix.duck.ratio)}` +
+    `:attack=${preciseNum(mix.duck.attack)}` +
+    `:release=${preciseNum(mix.duck.release)}` +
+    (mix.duck.makeup !== undefined ? `:makeup=${preciseNum(mix.duck.makeup)}` : "");
+  const tail = [
+    ...(opts.normalizeLufs !== null
+      ? [`loudnorm=I=${opts.normalizeLufs}:TP=-1.5:LRA=11`]
+      : []),
+    ...(opts.volumeDb !== null && opts.volumeDb !== undefined
+      ? [`volume=${trimNum(opts.volumeDb)}dB`]
+      : []),
+  ];
+  return (
+    `[0:a]${speech}[speech];` +
+    `[speech]asplit=2[sc][main];` +
+    `[1:a]${bed}[bed];` +
+    `[bed][sc]${sidechain}[ducked];` +
+    `[main][ducked]amix=inputs=2:duration=first:normalize=0` +
+    (tail.length > 0 ? `,${tail.join(",")}` : "") +
+    "[a]"
+  );
+}
+
 /**
  * Build the single-pass render command for a compiled timeline.
  * All trims/cuts become one select filter over the source — no intermediate
  * renders, ever. (Recipe proven in vedit's test suite.) Transform ops
- * (speed/resize/volume) compose into the same single pass.
+ * (speed/resize/volume) compose into the same single pass; `opts.mix` moves
+ * the audio chain into -filter_complex (sidechain ducking + amix) while the
+ * video -vf chain stays untouched — still exactly one ffmpeg invocation.
  */
 export function buildRenderCommand(
   input: string,
@@ -95,9 +201,23 @@ export function buildRenderCommand(
     "format=yuv420p",
   ].join(",");
 
-  const argv = ["-nostdin", "-hide_banner", "-y", "-i", input, "-vf", vf];
+  // audio-mix without an audio stream is a silent no-op (validated as a
+  // NO_AUDIO_STREAM warning) — never add the bed input or graph then
+  const mix = hasAudio && opts.mix ? opts.mix : undefined;
 
-  if (hasAudio) {
+  const argv = ["-nostdin", "-hide_banner", "-y", "-i", input];
+  if (mix) argv.push("-stream_loop", "-1", "-i", mix.bedFile);
+  argv.push("-vf", vf);
+
+  if (mix) {
+    // audio moves into -filter_complex; termination is NATURAL (no -shortest,
+    // no -t): video ends at the last kept frame, audio at amix's first input
+    argv.push(
+      "-filter_complex", buildMixFilterGraph(expr, mix, opts, speed),
+      "-map", "0:v", "-map", "[a]",
+      "-c:a", "aac", "-b:a", opts.audioBitrate,
+    );
+  } else if (hasAudio) {
     const af = [
       `aselect='${expr}'`,
       "asetpts=N/SR/TB",
