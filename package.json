@@ -1,0 +1,25 @@
+{
+  "name": "video-toolkit",
+  "version": "0.1.0",
+  "description": "Agent-native video editing toolkit: deterministic tools, versioned edit plans, single-pass rendering.",
+  "type": "module",
+  "bin": {
+    "video": "dist/cli/index.js",
+    "video-mcp": "dist/agent/mcp-server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli/index.js dist/agent/mcp-server.js",
+    "test": "tsc && node --test \"dist/test/*.test.js\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
