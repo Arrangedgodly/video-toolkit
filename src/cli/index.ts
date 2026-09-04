@@ -52,8 +52,10 @@ plan operations: trim (keep range), cut (remove range), normalize-audio,
 
 flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_videotoolbox>
        --mode <final|preview>(render)  --seconds N(benchmark)
-       plan: --cuts-from <silence.json> [--min-duration s] [--pad s] (one bridge
-             per invocation) or --highlights-from <highlights.json>
+       plan: --cuts-from <silence.json|filler.json> (one bridge per invocation;
+             silence: [--min-duration s=0.5] [--pad s=0.25];
+             filler: [--filler-pad-before s=0.10] [--filler-pad-end s=0.25])
+             or --highlights-from <highlights.json>
              [--count N=5] [--min-score 0.35] [--pad s=0.5]`;
 
 interface CliFlags {
@@ -75,6 +77,8 @@ interface CliFlags {
   width?: number;
   output?: string;
   cutsFrom?: string;
+  fillerPadBefore?: number;
+  fillerPadEnd?: number;
   highlightsFrom?: string;
   engine?: string;
   model?: string;
@@ -114,6 +118,8 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--width") f.width = Number(argv[++i]);
     else if (a === "--output" || a === "-o") f.output = argv[++i];
     else if (a === "--cuts-from") f.cutsFrom = argv[++i];
+    else if (a === "--filler-pad-before") f.fillerPadBefore = Number(argv[++i]);
+    else if (a === "--filler-pad-end") f.fillerPadEnd = Number(argv[++i]);
     else if (a === "--highlights-from") f.highlightsFrom = argv[++i];
     else if (a === "--engine") f.engine = argv[++i];
     else if (a === "--model") f.model = argv[++i];
@@ -145,6 +151,8 @@ async function scaffoldPlan(input: string, f: CliFlags) {
       cutsFrom: f.cutsFrom,
       minDuration: f.minDuration,
       pad: f.pad,
+      fillerPadBefore: f.fillerPadBefore,
+      fillerPadEnd: f.fillerPadEnd,
       highlightsFrom: f.highlightsFrom,
       count: f.count,
       minScore: f.minScore,

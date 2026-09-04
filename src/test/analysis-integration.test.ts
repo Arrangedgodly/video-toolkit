@@ -271,3 +271,73 @@ test("plan rejects combining both bridges", async () => {
   assert.notEqual(r.code, 0);
   assert.ok(r.stderr.includes("OPERATION_INVALID"), r.stderr);
 });
+
+const fillerReport = (is: { start: number; end: number }[]) => ({
+  instances: is.map((i) => ({ ...i, phrase: "um", context: "so um yeah" })),
+});
+
+test("plan --cuts-from filler.json expands instances into cuts", async () => {
+  await writeFile(
+    "filler.json",
+    JSON.stringify(fillerReport([{ start: 1.0, end: 1.4 }, { start: 6.0, end: 6.3 }])),
+  );
+  const plan = await runCli<{
+    operations: { type: string; start: number; end: number }[];
+    output: { path: string };
+  }>("plan", SILENCE, "--cuts-from", "filler.json");
+  // whole-source trim + one cut per instance, padded 0.1 before / 0.25 after
+  assert.equal(plan.operations.length, 3, JSON.stringify(plan.operations));
+  assert.equal(plan.operations[0]?.type, "trim");
+  assert.deepEqual(plan.operations[1], { type: "cut", start: 0.9, end: 1.65 });
+  assert.deepEqual(plan.operations[2], { type: "cut", start: 5.9, end: 6.55 });
+
+  plan.output.path = "defiller.mp4";
+  await writeFile("defiller-plan.json", JSON.stringify(plan));
+  const v = await validatePlan("defiller-plan.json");
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  // 8s source minus (0.75 + 0.65) of padded cuts
+  assert.ok(Math.abs((v.timelineDuration ?? 0) - 6.6) < 0.01, `timeline ${v.timelineDuration}`);
+});
+
+test("plan --cuts-from filler.json honors the filler pads; silence --pad does not apply", async () => {
+  await writeFile(
+    "filler-pads.json",
+    JSON.stringify(fillerReport([{ start: 1.0, end: 1.4 }, { start: 6.0, end: 6.3 }])),
+  );
+  const plan = await runCli<{ operations: { type: string; start: number; end: number }[] }>(
+    "plan",
+    SILENCE,
+    "--cuts-from",
+    "filler-pads.json",
+    "--filler-pad-before",
+    "0",
+    "--filler-pad-end",
+    "0",
+    "--pad",
+    "0.5", // silence-only: must leave the filler estimates untouched
+  );
+  assert.deepEqual(plan.operations.slice(1), [
+    { type: "cut", start: 1, end: 1.4 },
+    { type: "cut", start: 6, end: 6.3 },
+  ]);
+});
+
+test("plan --cuts-from with an empty filler report keeps the whole-source scaffold", async () => {
+  await writeFile("empty-filler.json", JSON.stringify(fillerReport([])));
+  const plan = await runCli<{ operations: { type: string; start: number; end: number }[] }>(
+    "plan",
+    SILENCE,
+    "--cuts-from",
+    "empty-filler.json",
+  );
+  assert.equal(plan.operations.length, 1);
+  assert.equal(plan.operations[0]?.type, "trim");
+  assert.equal(plan.operations[0]?.start, 0);
+});
+
+test("plan --cuts-from rejects a report that is neither silence nor filler", async () => {
+  await writeFile("bad-filler.json", JSON.stringify({ candidates: [] })); // highlight-shaped
+  const r = await runCliExpectError("plan", SILENCE, "--cuts-from", "bad-filler.json");
+  assert.notEqual(r.code, 0);
+  assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
+});

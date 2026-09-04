@@ -4,6 +4,7 @@ import { parseSilenceOutput } from "../analysis/silence.js";
 import { parseSceneOutput } from "../analysis/scenes.js";
 import { silenceToCuts } from "../analysis/silence-to-cuts.js";
 import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
+import { fillerToCuts } from "../analysis/filler-to-cuts.js";
 
 test("parseSilenceOutput pairs starts with ends in order", () => {
   const stderr = [
@@ -190,4 +191,76 @@ test("candidates fully outside the source are dropped after clamping", () => {
     { count: 5, minScore: 0.35, pad: 0.5 },
   );
   assert.deepEqual(trims, [{ type: "trim", start: 19.45, end: 20 }]);
+});
+
+const fillers = (is: { s: number; e: number }[]) => ({
+  instances: is.map((x) => ({ start: x.s, end: x.e, phrase: "um", context: "… um …" })),
+});
+
+test("fillerToCuts expands each instance with asymmetric pads", () => {
+  const cuts = fillerToCuts(
+    fillers([{ s: 2, e: 2.4 }, { s: 10, e: 10.5 }]),
+    30,
+    { padBefore: 0.1, padEnd: 0.25 },
+  );
+  assert.deepEqual(cuts, [
+    { type: "cut", start: 1.9, end: 2.65 },
+    { type: "cut", start: 9.9, end: 10.75 },
+  ]);
+});
+
+test("fillerToCuts clamps to source bounds", () => {
+  const cuts = fillerToCuts(
+    fillers([{ s: 0.05, e: 1 }, { s: 29, e: 30 }]),
+    30,
+    { padBefore: 0.1, padEnd: 0.25 },
+  );
+  assert.deepEqual(cuts, [
+    { type: "cut", start: 0, end: 1.25 },
+    { type: "cut", start: 28.9, end: 30 },
+  ]);
+});
+
+test("fillerToCuts drops instances fully outside the source", () => {
+  assert.deepEqual(
+    fillerToCuts(fillers([{ s: 31, e: 32 }]), 30, { padBefore: 0.1, padEnd: 0.25 }),
+    [],
+  );
+});
+
+test("fillerToCuts drops sub-MIN_CUT ranges with zero pads", () => {
+  assert.deepEqual(
+    fillerToCuts(fillers([{ s: 4, e: 4.005 }]), 30, { padBefore: 0, padEnd: 0 }),
+    [],
+  );
+});
+
+test("fillerToCuts with zero pads cuts the exact estimated ranges", () => {
+  assert.deepEqual(
+    fillerToCuts(fillers([{ s: 3, e: 4.2 }]), 30, { padBefore: 0, padEnd: 0 }),
+    [{ type: "cut", start: 3, end: 4.2 }],
+  );
+});
+
+test("fillerToCuts rounds timestamps to 3 decimals", () => {
+  const cuts = fillerToCuts(fillers([{ s: 1.23456, e: 2.34567 }]), 30, {
+    padBefore: 0.111,
+    padEnd: 0.222,
+  });
+  assert.deepEqual(cuts, [{ type: "cut", start: 1.124, end: 2.568 }]);
+});
+
+test("an empty filler report yields no cuts", () => {
+  assert.deepEqual(
+    fillerToCuts({ instances: [] }, 30, { padBefore: 0.1, padEnd: 0.25 }),
+    [],
+  );
+});
+
+test("fillerToCuts is deterministic for identical input", () => {
+  const report = fillers([{ s: 1, e: 1.5 }, { s: 5, e: 5.4 }]);
+  assert.deepEqual(
+    fillerToCuts(report, 30, { padBefore: 0.1, padEnd: 0.25 }),
+    fillerToCuts(report, 30, { padBefore: 0.1, padEnd: 0.25 }),
+  );
 });

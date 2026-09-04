@@ -1,22 +1,27 @@
 import { readFile } from "node:fs/promises";
 import { fail } from "./errors.js";
-import { HighlightReport, SilenceReport } from "./schemas.js";
+import { FillerReport, HighlightReport, SilenceReport } from "./schemas.js";
 import { silenceToCuts } from "../analysis/silence-to-cuts.js";
 import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
+import { fillerToCuts } from "../analysis/filler-to-cuts.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 
 export interface ScaffoldOpts extends CacheOpts {
   cutsFrom?: string;
   minDuration?: number;
   pad?: number;
+  fillerPadBefore?: number;
+  fillerPadEnd?: number;
   highlightsFrom?: string;
   count?: number;
   minScore?: number;
 }
 
 /** Scaffold a valid whole-source plan, optionally expanding an observation
- * into operations via a deterministic bridge: silence → cuts, highlights →
- * top-N trims (a compilation). Shared by the CLI and the MCP server. */
+ * into operations via a deterministic bridge: silence → cuts, filler → cuts,
+ * highlights → top-N trims (a compilation). Shared by the CLI and the MCP
+ * server. `--cuts-from` accepts a silence OR filler report, discriminated by
+ * shape (SilenceReport first — the two never overlap on required keys). */
 export async function scaffoldPlanObject(
   input: string,
   opts: ScaffoldOpts = {},
@@ -46,15 +51,26 @@ export async function scaffoldPlanObject(
       fail("OBSERVATION_INVALID", `observation file is missing or not valid JSON: ${opts.cutsFrom}`);
     }
     const parsed = SilenceReport.safeParse(doc);
-    if (!parsed.success) {
-      fail("OBSERVATION_INVALID", "file is not a valid silence report", { file: opts.cutsFrom });
+    if (parsed.success) {
+      operations.push(
+        ...silenceToCuts(parsed.data, media.duration, {
+          minDuration: opts.minDuration ?? 0.5,
+          pad: opts.pad ?? 0.25,
+        }),
+      );
+    } else {
+      // not silence-shaped — try filler before rejecting
+      const filler = FillerReport.safeParse(doc);
+      if (!filler.success) {
+        fail("OBSERVATION_INVALID", "file is not a valid silence or filler report", { file: opts.cutsFrom });
+      }
+      operations.push(
+        ...fillerToCuts(filler.data, media.duration, {
+          padBefore: opts.fillerPadBefore ?? 0.1,
+          padEnd: opts.fillerPadEnd ?? 0.25,
+        }),
+      );
     }
-    operations.push(
-      ...silenceToCuts(parsed.data, media.duration, {
-        minDuration: opts.minDuration ?? 0.5,
-        pad: opts.pad ?? 0.25,
-      }),
-    );
   }
 
   if (opts.highlightsFrom) {
