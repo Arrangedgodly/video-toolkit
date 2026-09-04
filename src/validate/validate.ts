@@ -103,7 +103,8 @@ export async function validatePlan(
       op.type === "captions" ||
       op.type === "overlay-text" ||
       op.type === "audio-mix" ||
-      op.type === "crossfade"
+      op.type === "crossfade" ||
+      op.type === "export-gif"
     ) {
       const first = seenTransforms.get(op.type);
       if (first !== undefined) {
@@ -182,6 +183,27 @@ export async function validatePlan(
           });
         }
       }
+      if (op.type === "export-gif") {
+        // terminal op (vedit's extract-audio step precedent): an export
+        // changes the output FORMAT, so nothing may follow it — the plan is a
+        // declaration, and "export then keep editing" has no render meaning
+        if (i + 1 !== plan.operations.length) {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: i + 1,
+            message:
+              `export-gif is a terminal op — it must be the LAST operation ` +
+              `(operations follow it at position ${i + 2})`,
+          });
+        }
+        if (op.from !== undefined && op.to !== undefined && op.from >= op.to) {
+          errors.push({
+            code: "RANGE_NEGATIVE",
+            operation: i + 1,
+            message: `export-gif: from (${op.from}) must be before to (${op.to})`,
+          });
+        }
+      }
     }
   }
   const captionsOp = plan.operations.find(
@@ -199,6 +221,10 @@ export async function validatePlan(
   const audioMixOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
       op.type === "audio-mix",
+  );
+  const exportGifOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "export-gif" }> =>
+      op.type === "export-gif",
   );
   if ((captionsOp || overlayTextOp) && errors.length === 0) {
     const { hasFilter } = await import("../media/ffmpeg.js");
@@ -294,6 +320,17 @@ export async function validatePlan(
     }
   }
 
+  // export-gif + audio-mix: GIF carries no audio — mixing a bed under audio
+  // that is then discarded would make audio-mix a silent no-op (the
+  // crossfade+audio-mix fence precedent); reject rather than waste the graph
+  if (exportGifOp && audioMixOp) {
+    errors.push({
+      code: "OPERATION_INVALID",
+      operation: plan.operations.indexOf(exportGifOp) + 1,
+      message: `export-gif + audio-mix in one plan is not a supported composition (GIF carries no audio — the mixed bed would be silently dropped); drop one of the two`,
+    });
+  }
+
   // overlay-text `to` lives on the OUTPUT timeline — bound it by the expected
   // output duration ((timeline − crossfade shrinkage) / speed; the same
   // canonical expectation the render progress/verify stages use)
@@ -313,6 +350,31 @@ export async function validatePlan(
     }
   }
 
+  // export-gif from/to select a sub-range of the SAME canonical OUTPUT
+  // timeline (the overlay-text `to` bound, applied to both window edges — a
+  // window beyond the output would render an empty/degenerate gif)
+  if (exportGifOp && (exportGifOp.from !== undefined || exportGifOp.to !== undefined)) {
+    const speedOp = plan.operations.find(
+      (op): op is Extract<(typeof plan.operations)[number], { type: "speed" }> =>
+        op.type === "speed",
+    );
+    const base = report.expectedDuration ?? report.timelineDuration ?? 0;
+    const expectedOutput = speedOp ? base / speedOp.factor : base;
+    const gifIndex = plan.operations.indexOf(exportGifOp) + 1;
+    for (const [name, value] of [
+      ["from", exportGifOp.from],
+      ["to", exportGifOp.to],
+    ] as const) {
+      if (value !== undefined && value > expectedOutput + DURATION_TOLERANCE) {
+        errors.push({
+          code: "OPERATION_INVALID",
+          operation: gifIndex,
+          message: `export-gif: ${name} (${value}) exceeds expected output duration ${expectedOutput.toFixed(3)}s`,
+        });
+      }
+    }
+  }
+
   // output path sanity
   const absOut = path.resolve(plan.output.path);
   const absSource = path.resolve(plan.source);
@@ -320,6 +382,15 @@ export async function validatePlan(
     errors.push({
       code: "OUTPUT_WOULD_OVERWRITE_SOURCE",
       message: "output path would overwrite the source file",
+    });
+  }
+  // the gif export muxes to the gif muxer — the extension is the contract
+  // (enforced here AND in the builder, the render path's own guard)
+  if (exportGifOp && !plan.output.path.toLowerCase().endsWith(".gif")) {
+    errors.push({
+      code: "OUTPUT_PATH_INVALID",
+      operation: plan.operations.indexOf(exportGifOp) + 1,
+      message: `export-gif: output.path must end in .gif (got: ${plan.output.path})`,
     });
   }
   const parent = path.dirname(absOut);
@@ -352,6 +423,17 @@ export async function validatePlan(
         message: `source has no audio stream; ${audioOps.map(({ op }) => op.type).join(", ")} would be no-ops`,
       });
     }
+  }
+
+  // GIF carries no audio: an audio-bearing source is dropped BY DESIGN — a
+  // warning, not an error (the NO_AUDIO_STREAM warning pattern, inverted;
+  // volume/normalize-audio under export-gif are no-ops the same way)
+  if (media.audio && exportGifOp) {
+    warnings.push({
+      code: "GIF_AUDIO_DROPPED",
+      operation: plan.operations.indexOf(exportGifOp) + 1,
+      message: `export-gif: source has audio, but GIF carries none — the audio stream is dropped (audio ops are no-ops under export-gif)`,
+    });
   }
 
   return { ...report, valid: errors.length === 0 };

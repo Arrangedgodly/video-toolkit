@@ -448,3 +448,115 @@ test("builder: without crossfade the select path is unchanged (no -filter_comple
   assert.ok(argv[argv.indexOf("-vf") + 1]!.startsWith("select='between(t,0.000,3.000)+"), argv.join(" "));
   assert.notEqual(argv.indexOf("-af"), -1);
 });
+
+// ---- export-gif (single-pass palette graph; recipe proven verbatim in
+// vedit's build_gif, vedit.py:363-375 — palettegen+paletteuse INSIDE the one
+// -filter_complex, never a separate palette pass)
+
+test("builder: export-gif emits vedit's palette graph verbatim after the select chain", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts,
+    gif: { width: 480, fps: 12 },
+  }, true);
+  assert.deepEqual(argv, [
+    "-nostdin", "-hide_banner", "-y",
+    "-i", "in.mp4",
+    "-filter_complex",
+    "[0:v]select='between(t,0.000,10.000)',setpts=N/FRAME_RATE/TB," +
+      "fps=12,scale=480:-2:flags=lanczos,split[a][b];" +
+      "[a]palettegen=stats_mode=diff[p];" +
+      "[b][p]paletteuse=dither=bayer:bayer_scale=5[v]",
+    "-map", "[v]",
+    "-an",
+    "out.gif",
+  ]);
+  // the gif branch: no h264/movflags/audio anywhere
+  assert.equal(argv.includes("-c:v"), false);
+  assert.equal(argv.includes("-movflags"), false);
+  assert.equal(argv.includes("-af"), false);
+  assert.equal(argv.includes("-c:a"), false);
+});
+
+test("builder: export-gif window math incl. omitted bounds (trim before fps, 3-decimal times)", () => {
+  const both = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 480, fps: 12, from: 0.5, to: 3 },
+  }, true);
+  const fromOnly = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 480, fps: 12, from: 1 },
+  }, true);
+  const toOnly = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 480, fps: 12, to: 3.4567 },
+  }, true);
+  const g = (argv: string[]) => argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.ok(g(both).includes("trim=start=0.500:end=3.000,setpts=PTS-STARTPTS,fps=12"), g(both));
+  assert.ok(g(fromOnly).includes("trim=start=1.000,setpts=PTS-STARTPTS,fps=12"), g(fromOnly));
+  assert.ok(g(toOnly).includes("trim=end=3.457,setpts=PTS-STARTPTS,fps=12"), g(toOnly));
+  // no window -> no trim at all (vedit's shape: nothing between setpts and fps)
+  assert.ok(g(buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 480, fps: 12 },
+  }, true)).includes("setpts=N/FRAME_RATE/TB,fps=12"), "no trim when both bounds omitted");
+  // custom width/fps map 1:1
+  assert.ok(g(both).includes("fps=12,scale=480:-2:flags=lanczos"));
+  const wide = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 640, fps: 15 },
+  }, true);
+  assert.ok(g(wide).includes("fps=15,scale=640:-2:flags=lanczos"), g(wide));
+});
+
+test("builder: export-gif composes after speed/scale/subtitles/overlay; no yuv420p", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts,
+    speedFactor: 2,
+    scaleWidth: 640,
+    subtitleFile: "subs.srt",
+    overlayText: overlay,
+    gif: { width: 480, fps: 12 },
+  }, true);
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  const order = ["setpts=N/FRAME_RATE/TB/2", "scale=640:-2", "subtitles=", "drawtext=", "fps=12"];
+  let prev = -1;
+  for (const part of order) {
+    const at = graph.indexOf(part);
+    assert.ok(at !== -1, `${part} missing: ${graph}`);
+    assert.ok(at > prev, `${part} must come after the previous stage: ${graph}`);
+    prev = at;
+  }
+  assert.equal(graph.includes("format=yuv420p"), false, graph); // palette path owns pixfmt
+});
+
+test("builder: export-gif rides the transition chain after the last xfade link", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.gif",
+    { ...opts, crossfade: { duration: 0.5, kind: "fade" }, gif: { width: 480, fps: 12, from: 0.5, to: 2 } },
+    true, // hasAudio — irrelevant under gif: no acrossfade, -an
+  );
+  assert.deepEqual(argv, [
+    "-nostdin", "-hide_banner", "-y",
+    "-ss", "0.000", "-t", "3.000", "-i", "in.mp4",
+    "-ss", "5.000", "-t", "3.500", "-i", "in.mp4",
+    "-filter_complex",
+    "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=2.500[vx];" +
+      "[vx]trim=start=0.500:end=2.000,setpts=PTS-STARTPTS," +
+      "fps=12,scale=480:-2:flags=lanczos,split[a][b];" +
+      "[a]palettegen=stats_mode=diff[p];" +
+      "[b][p]paletteuse=dither=bayer:bayer_scale=5[v]",
+    "-map", "[v]",
+    "-an",
+    "out.gif",
+  ]);
+  assert.equal(argv.join(" ").includes("acrossfade"), false);
+  assert.equal(argv.includes("-c:v"), false);
+});
+
+test("builder: export-gif refusals — non-.gif output and the audio-mix combo", () => {
+  assert.throws(
+    () => buildRenderCommand("in.mp4", segs, "out.mp4", { ...opts, gif: { width: 480, fps: 12 } }, true),
+    (e: unknown) => (e as { code?: string }).code === "OUTPUT_PATH_INVALID",
+  );
+  assert.throws(
+    () => buildRenderCommand("in.mp4", segs, "out.gif", { ...opts, gif: { width: 480, fps: 12 }, mix }, true),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+});

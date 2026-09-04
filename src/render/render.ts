@@ -1,13 +1,23 @@
 import path from "node:path";
 import { stat } from "node:fs/promises";
 import { ToolError, fail, type ErrorCode } from "../core/errors.js";
-import { buildRenderCommand, channelLayoutFor, runFFmpeg, type EncoderId, type MixOptions } from "../media/ffmpeg.js";
+import {
+  buildRenderCommand,
+  channelLayoutFor,
+  runFFmpeg,
+  type EncoderId,
+  type GifExportOptions,
+  type MixOptions,
+} from "../media/ffmpeg.js";
 import { inspectFile } from "../media/ffprobe.js";
 import { adjustedDuration } from "../core/timeline.js";
 import { validatePlan } from "../validate/validate.js";
 import type { CacheOpts } from "../cache/cache.js";
 
 export type RenderMode = "final" | "preview";
+/** the encoder actually used: the h264 pair, or "gif" when the plan's
+ * terminal `export-gif` op muxed to the gif muxer (no h264 path runs) */
+export type RenderEncoder = EncoderId | "gif";
 
 export interface RenderOpts extends CacheOpts {
   mode?: RenderMode;
@@ -19,7 +29,7 @@ export interface RenderOpts extends CacheOpts {
 export interface RenderResult {
   output: string;
   mode: RenderMode;
-  encoder: EncoderId;
+  encoder: RenderEncoder;
   timelineSegments: number;
   timelineDuration: number;
   outputDuration: number;
@@ -122,11 +132,33 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     (op): op is Extract<(typeof plan.operations)[number], { type: "crossfade" }> =>
       op.type === "crossfade",
   );
+  const exportGifOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "export-gif" }> =>
+      op.type === "export-gif",
+  );
   const hasAudio = report.media.audio != null;
   const speedFactor = speedOp?.factor;
 
+  // terminal gif export: defaults are vedit's proven values (width 480,
+  // fps 12); GIF carries no audio, so every audio-plumbing input below is
+  // neutralized (validate already fenced audio-mix and warned
+  // GIF_AUDIO_DROPPED — never compute a graph that is then discarded)
+  const gif: GifExportOptions | undefined = exportGifOp
+    ? {
+        width: exportGifOp.width ?? 480,
+        fps: exportGifOp.fps ?? 12,
+        from: exportGifOp.from,
+        to: exportGifOp.to,
+      }
+    : undefined;
+  const audioActive = hasAudio && !gif;
+
   // resize and preview both scale; when both apply, use the smaller width so
-  // preview stays cheap — unless the resize is exact (w×h), which wins
+  // preview stays cheap — unless the resize is exact (w×h), which wins.
+  // Under a gif export the preview's 640w is NOT applied: the op's own
+  // width/fps already bound the preview cost, and double-scaling only blurs
+  // (the resize op's scale still composes before the gif scale — the
+  // append-after rule).
   let scaleWidth = settings.scaleWidth;
   let scaleHeight: number | undefined;
   if (resizeOp) {
@@ -135,6 +167,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     if (scaleHeight === undefined && settings.scaleWidth !== undefined) {
       scaleWidth = Math.min(resizeOp.width, settings.scaleWidth);
     }
+  }
+  if (gif) {
+    scaleWidth = resizeOp ? resizeOp.width : undefined;
+    scaleHeight = resizeOp?.height;
   }
 
   // expected output duration = (timeline − crossfade shrinkage) / speed — the
@@ -152,7 +188,7 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
   // probed media info — the bed conforms to the speech, never the reverse,
   // and no new probes happen (defaults per R1's committed parameter table)
   let mix: MixOptions | null = null;
-  if (audioMixOp && hasAudio && report.media.audio) {
+  if (audioMixOp && audioActive && report.media.audio) {
     const audio = report.media.audio;
     mix = {
       bedFile: audioMixOp.file,
@@ -170,6 +206,13 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     };
   }
 
+  // a gif export renders only its OUTPUT-timeline window [from, to] — the
+  // progress math and the verify comparison consume the window length, not
+  // the full expectation (otherwise every sub-range gif would warn)
+  const gifWindowDuration = gif
+    ? Math.max(0, (gif.to ?? expectedDuration) - (gif.from ?? 0))
+    : expectedDuration;
+
   const command = buildRenderCommand(
     plan.source,
     report.timeline,
@@ -182,10 +225,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
       audioBitrate: settings.audioBitrate,
       scaleWidth,
       scaleHeight,
-      normalizeLufs: normalizeOp && hasAudio ? (normalizeOp.target ?? -16) : null,
+      normalizeLufs: normalizeOp && audioActive ? (normalizeOp.target ?? -16) : null,
       speedFactor,
       volumeDb:
-        volumeOp && hasAudio
+        volumeOp && audioActive
           ? volumeOp.db !== undefined
             ? volumeOp.db
             : 20 * Math.log10(volumeOp.factor ?? 1)
@@ -209,13 +252,15 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
       crossfade: crossfadeOp
         ? { duration: crossfadeOp.duration, kind: crossfadeOp.kind }
         : undefined,
+      // terminal export op: the single-pass palette graph + gif muxer
+      gif,
     },
     hasAudio,
   );
   debug(`command: ${command.join(" ")}`);
 
   const run = await runFFmpeg(command.slice(1), {
-    expectedDuration,
+    expectedDuration: gifWindowDuration,
     onProgress: opts.onProgress,
   });
   lap("ffmpeg");
@@ -225,16 +270,16 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
   // compare against the speed-adjusted expectation (the same value the
   // progress math and the mix bed's atrim bound use) — a correct sped-up
   // render must not warn; only a genuinely wrong duration should
-  if (Math.abs(outInfo.duration - expectedDuration) > 1.0) {
+  if (Math.abs(outInfo.duration - gifWindowDuration) > 1.0) {
     debug(
-      `warning: output duration ${outInfo.duration.toFixed(2)}s differs from expected ${expectedDuration.toFixed(2)}s`,
+      `warning: output duration ${outInfo.duration.toFixed(2)}s differs from expected ${gifWindowDuration.toFixed(2)}s`,
     );
   }
 
   return {
     output: path.resolve(output),
     mode,
-    encoder,
+    encoder: gif ? "gif" : encoder,
     timelineSegments: report.timeline.length,
     timelineDuration: report.timelineDuration,
     outputDuration: outInfo.duration,

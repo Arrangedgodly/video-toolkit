@@ -228,3 +228,55 @@ test("audio-mix bounds enforced: level dB, LINEAR threshold, duck ranges", () =>
     );
   }
 });
+
+// ---- export-gif (T19; terminal export op — first of the export-op class,
+// NOT a TransformOpType member: it changes the output FORMAT, not content)
+
+test("export-gif parses minimal (all keys optional) and full forms", () => {
+  const minimal = EditPlan.parse({
+    ...base,
+    output: { path: "out.gif" },
+    operations: [{ type: "export-gif" }],
+  });
+  assert.equal(minimal.operations[0]?.type, "export-gif");
+
+  const full = EditPlan.parse({
+    ...base,
+    output: { path: "out.gif" },
+    operations: [{ type: "export-gif", width: 640, fps: 15, from: 0.5, to: 4 }],
+  });
+  assert.equal(full.operations.length, 1);
+});
+
+test("export-gif bounds enforced: integer width (resize mirror), fps ≤ 60, window ≥ 0", () => {
+  const bad: unknown[] = [
+    { type: "export-gif", width: 0 },
+    { type: "export-gif", width: 16385 },
+    { type: "export-gif", width: 480.5 }, // non-integer
+    { type: "export-gif", fps: 0 },
+    { type: "export-gif", fps: -1 },
+    { type: "export-gif", fps: 60.5 },
+    { type: "export-gif", from: -0.5 },
+    { type: "export-gif", to: -1 },
+  ];
+  for (const op of bad) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, output: { path: "out.gif" }, operations: [op] }).success,
+      false,
+      `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+  // boundary values are accepted: width 1..16384, fps exactly 60, window at 0
+  for (const op of [
+    { type: "export-gif", width: 1 },
+    { type: "export-gif", width: 16384 },
+    { type: "export-gif", fps: 60 },
+    { type: "export-gif", from: 0, to: 0.5 },
+  ]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, output: { path: "out.gif" }, operations: [op] }).success,
+      true,
+      `expected acceptance: ${JSON.stringify(op)}`,
+    );
+  }
+});

@@ -798,3 +798,205 @@ test("crossfade: kind 'custom' parses at schema level but is fenced — OPERATIO
     (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
   );
 });
+
+// ---- export-gif (terminal op; single-pass palette graph — the recipe proven
+// in vedit build_gif, vedit.py:363-375, palettegen+paletteuse INSIDE the one
+// -filter_complex; the classic two-pass palette workflow would break
+// INVARIANT 1 and is never used)
+
+/** raw ffprobe stream field (fields inspectFile does not surface). */
+async function probeStreamField(file: string, field: string): Promise<string> {
+  const r = await runCapture("ffprobe", [
+    "-v", "error", "-select_streams", "v:0",
+    "-show_entries", `stream=${field}`, "-of", "default=nw=1:nk=1", file,
+  ]);
+  assert.equal(r.code, 0, r.stderr);
+  return r.stdout.trim();
+}
+
+test("export-gif: real gif in ONE invocation — codec/dims/frame law/window duration (speed-aware)", async () => {
+  // trim[0,6] at 2x -> expected output 3s; window [0.5, 2] -> 1.5s at 12 fps = 18 frames
+  const p = await writePlan("g1.json", plan([
+    { type: "trim", start: 0, end: 6 },
+    { type: "speed", factor: 2 },
+    { type: "export-gif", width: 480, fps: 12, from: 0.5, to: 2 },
+  ], "g1.gif"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  // audio-bearing source -> the documented drop warning (not an error)
+  assert.ok(
+    v.warnings.some((w) => w.code === "GIF_AUDIO_DROPPED"),
+    JSON.stringify(v.warnings),
+  );
+
+  const debugLines: string[] = [];
+  const r = await renderPlan(p, { debug: (line) => debugLines.push(line) });
+  // INVARIANT 1: exactly ONE ffmpeg invocation; palettegen AND paletteuse
+  // inside the SAME -filter_complex (the two-pass palette workflow is NOT used)
+  assert.equal(r.command[0], "ffmpeg");
+  assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  assert.ok(graph.includes("palettegen=stats_mode=diff"), graph);
+  assert.ok(graph.includes("paletteuse=dither=bayer:bayer_scale=5"), graph);
+  assert.ok(graph.includes("trim=start=0.500:end=2.000,setpts=PTS-STARTPTS,fps=12"), graph);
+  assert.ok(graph.includes("scale=480:-2:flags=lanczos"), graph);
+  assert.equal(r.command.includes("-c:v"), false); // gif muxer, no h264 path
+  assert.equal(r.command.includes("-movflags"), false);
+  assert.ok(r.command.includes("-an")); // GIF carries no audio
+  assert.equal(r.encoder, "gif");
+
+  // ffprobe: it IS a gif, at the op's width with aspect preserved, no audio
+  const info = await inspectFile(r.output);
+  assert.equal(info.video?.codec, "gif");
+  assert.equal(info.video?.width, 480);
+  assert.ok(Math.abs((info.video?.height ?? 0) - 270) <= 2, `height ${info.video?.height} (720/1280·480 = 270, -2 keeps even)`);
+  assert.equal(info.audio, undefined);
+  // duration = the window (2 − 0.5 = 1.5s of the 3s sped-up output), within one frame at 12 fps
+  assert.ok(Math.abs(r.outputDuration - 1.5) < 0.1, `duration ${r.outputDuration}`);
+  assert.equal(await probeStreamField(r.output, "nb_frames"), "18"); // 1.5 s × 12 fps exactly
+  // the window feeds progress/verify — a correct windowed gif must not warn
+  assert.ok(
+    debugLines.every((l) => !l.includes("warning: output duration")),
+    `unexpected verify warning: ${debugLines.join(" | ")}`,
+  );
+});
+
+test("export-gif: sub-range on the crossfade-adjusted OUTPUT timeline (composition)", async () => {
+  // XF_TRIMS = 10.0s timeline, crossfade 0.5 -> expected 9.0s; window [2, 5] -> 3.0s
+  const p = await writePlan("g2.json", xfPlan([
+    ...XF_TRIMS,
+    { type: "crossfade", duration: 0.5 },
+    { type: "export-gif", from: 2, to: 5 },
+  ], "g2.gif"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  const r = await renderPlan(p);
+  assert.equal(r.command.filter((a) => a === "-i").length, 3, "transition chain: 3 inputs, one invocation");
+  assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  // the LAST xfade link (N=3 -> offset 5.500) hands off to [vx], which feeds
+  // the window + palette suffix
+  assert.ok(graph.includes("offset=5.500[vx];[vx]trim=start=2.000:end=5.000"), graph);
+  assert.ok(graph.includes("paletteuse=dither=bayer:bayer_scale=5[v]"), graph);
+  assert.equal(r.command.join(" ").includes("acrossfade"), false); // audio chain never built
+  assert.ok(Math.abs(r.outputDuration - 3.0) < 0.1, `duration ${r.outputDuration}`);
+  assert.equal(await probeStreamField(r.output, "nb_frames"), "36"); // 3.0 s × 12 fps
+  const info = await inspectFile(r.output);
+  assert.equal(info.video?.codec, "gif");
+  assert.equal(info.video?.width, 480); // default width
+});
+
+test("export-gif: preview parity — a real .preview.gif, op width governs, full omitted window", async () => {
+  // no from/to -> the whole output (6s of FIXTURE); preview must stay off the
+  // final path (INVARIANT 2) and skip the mp4 preview's 640w double-scale
+  const p = await writePlan("g3.json", plan([
+    { type: "trim", start: 0, end: 6 },
+    { type: "export-gif" },
+  ], "g3.gif"));
+  const r = await renderPlan(p, { mode: "preview" });
+  assert.ok(r.output.endsWith("g3.preview.gif"), r.output);
+  assert.equal(r.encoder, "gif");
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  assert.ok(graph.includes("fps=12,scale=480:-2:flags=lanczos"), graph);
+  assert.equal(graph.includes("scale=640"), false, "preview 640w not applied — the op width bounds the cost");
+  assert.equal(graph.includes("trim="), false, "no window -> no trim");
+  assert.ok(Math.abs(r.outputDuration - 6) < 0.1, `duration ${r.outputDuration}`);
+  const info = await inspectFile(r.output);
+  assert.equal(info.video?.codec, "gif");
+});
+
+test("export-gif validation: terminal position, window bounds (speed-aware), duplicates, extension, audio-mix combo", async () => {
+  // terminal position: nothing may follow the export op
+  const e0 = await validatePlan(await writePlan("ge0.json", plan([
+    { type: "export-gif" },
+    { type: "trim", start: 0, end: 2 },
+  ], "ge0.gif")));
+  assert.equal(e0.valid, false);
+  assert.equal(e0.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(e0.errors[0]?.message.includes("terminal"), e0.errors[0]?.message);
+
+  // from >= to
+  const e1 = await validatePlan(await writePlan("ge1.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "export-gif", from: 3, to: 3 },
+  ], "ge1.gif")));
+  assert.equal(e1.valid, false);
+  assert.equal(e1.errors[0]?.code, "RANGE_NEGATIVE");
+  assert.equal(e1.errors[0]?.operation, 2);
+
+  // to beyond the timeline (fixture is 12s)
+  const e2 = await validatePlan(await writePlan("ge2.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "export-gif", to: 13 },
+  ], "ge2.gif")));
+  assert.equal(e2.valid, false);
+  assert.equal(e2.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(e2.errors[0]?.message.includes("exceeds expected output duration"), e2.errors[0]?.message);
+
+  // speed-aware bound: timeline 12 at 2x -> expected 6s (both edges checked)
+  const e3 = await validatePlan(await writePlan("ge3.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "export-gif", to: 6.5 },
+  ], "ge3.gif")));
+  assert.equal(e3.valid, false);
+  assert.equal(e3.errors[0]?.code, "OPERATION_INVALID");
+  const e4 = await validatePlan(await writePlan("ge4.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "export-gif", from: 5.9, to: 6 },
+  ], "ge4.gif")));
+  assert.equal(e4.valid, true, JSON.stringify(e4.errors));
+
+  // duplicate export-gif (a duplicate ALSO trips the terminal fence on the
+  // first copy — something follows it — so match the duplicate error itself)
+  const e5 = await validatePlan(await writePlan("ge5.json", plan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "export-gif" },
+    { type: "export-gif", width: 320 },
+  ], "ge5.gif")));
+  assert.equal(e5.valid, false);
+  assert.ok(
+    e5.errors.some((x) => x.code === "OPERATION_INVALID" && x.operation === 3 && /duplicate export-gif/.test(x.message)),
+    JSON.stringify(e5.errors),
+  );
+
+  // .gif extension rule on BOTH paths (validate AND render re-validation)
+  const e6 = await validatePlan(await writePlan("ge6.json", plan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "export-gif" },
+  ], "ge6.mp4")));
+  assert.equal(e6.valid, false);
+  assert.equal(e6.errors[0]?.code, "OUTPUT_PATH_INVALID");
+  assert.ok(e6.errors[0]?.message.includes(".gif"), e6.errors[0]?.message);
+  await assert.rejects(
+    () => renderPlan("ge6.json"),
+    (e: unknown) => (e as { code?: string }).code === "OUTPUT_PATH_INVALID",
+  );
+
+  // export-gif + audio-mix: the bed would be a silently dropped no-op
+  const e7 = await validatePlan(await writePlan("ge7.json", plan([
+    { type: "trim", start: 0, end: 4 },
+    { type: "audio-mix", file: BED },
+    { type: "export-gif" },
+  ], "ge7.gif")));
+  assert.equal(e7.valid, false);
+  assert.ok(
+    e7.errors.some((x) => x.code === "OPERATION_INVALID" && x.message.includes("audio-mix")),
+    JSON.stringify(e7.errors),
+  );
+
+  // audio-less source: valid, and NO drop warning (nothing to drop)
+  const e8 = await validatePlan(await writePlan("ge8.json", {
+    version: 1,
+    source: NOAUDIO,
+    operations: [{ type: "trim", start: 0, end: 2 }, { type: "export-gif" }],
+    output: { path: "ge8.gif" },
+  }));
+  assert.equal(e8.valid, true, JSON.stringify(e8.errors));
+  assert.equal(
+    e8.warnings.some((w) => w.code === "GIF_AUDIO_DROPPED"),
+    false,
+    JSON.stringify(e8.warnings),
+  );
+});

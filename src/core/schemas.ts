@@ -208,6 +208,27 @@ export const CrossfadeOp = z.object({
   kind: z.enum(CROSSFADE_KIND_OR_CUSTOM).default("fade"),
 });
 
+/** Export op — TERMINAL (must be the LAST operation; validate enforces the
+ * position): changes the output FORMAT, not the content, so it is NOT a
+ * TransformOpType member. First of an export-op class. Renders the compiled
+ * OUTPUT timeline (post trim/cut, crossfade-adjusted, post-speed) to an
+ * animated GIF in the SAME single ffmpeg invocation — the palette is
+ * generated inside the one `-filter_complex` via `split` (recipe proven in
+ * vedit's build_gif, vedit.py:363-375; the classic two-pass palette workflow
+ * would violate INVARIANT 1 and is never used). GIF carries no audio: the
+ * audio stream is dropped by design (validate warns GIF_AUDIO_DROPPED). */
+export const ExportGifOp = z.object({
+  type: z.literal("export-gif"),
+  /** output width in px (int, mirror resize); height keeps aspect (-2, even).
+   * Default 480 (vedit's proven value). */
+  width: z.number().int().gt(0).max(16384).optional(),
+  /** output fps. Default 12 (vedit's proven value). */
+  fps: z.number().gt(0).max(60).optional(),
+  /** sub-range of the OUTPUT timeline (s); both absent = the whole output */
+  from: z.number().min(0).optional(),
+  to: z.number().min(0).optional(),
+});
+
 /** Transform ops apply to the whole output; they never affect which source
  * ranges are kept (that stays the trim/cut pair). At most one of each. */
 export type TransformOpType =
@@ -229,6 +250,7 @@ export const Operation = z.discriminatedUnion("type", [
   OverlayTextOp,
   AudioMixOp,
   CrossfadeOp,
+  ExportGifOp,
 ]);
 
 export const OutputSpec = z.object({

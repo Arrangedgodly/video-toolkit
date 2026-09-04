@@ -79,6 +79,26 @@ export interface RenderOptions {
    * r3-xfade-single-pass.md). Requires ≥2 segments and
    * duration < every segment length (validate enforces both). */
   crossfade?: CrossfadeOptions;
+  /** when set, append the single-pass GIF palette graph (plan op
+   * `export-gif`): the from/to OUTPUT-timeline window, then the recipe
+   * proven in vedit's build_gif (vedit.py:363-375) — fps → lanczos scale →
+   * split/palettegen(diff)/paletteuse(bayer:bayer_scale=5) INSIDE the one
+   * `-filter_complex` (the two-pass palette workflow would break INVARIANT 1
+   * and is never used). Audio is dropped (-an); h264/movflags are omitted
+   * (gif muxer). */
+  gif?: GifExportOptions;
+}
+
+/** Terminal export op `export-gif` (defaults applied by the render layer). */
+export interface GifExportOptions {
+  /** output width px; height keeps aspect (-2 = even) */
+  width: number;
+  /** output fps */
+  fps: number;
+  /** window start on the OUTPUT timeline (s); undefined = from the start */
+  from?: number;
+  /** window end on the OUTPUT timeline (s); undefined = to the end */
+  to?: number;
 }
 
 /** One crossfade transition declaration (plan op `crossfade`). Offsets are
@@ -264,6 +284,34 @@ function drawTextFilter(o: OverlayTextOptions): string {
   return `drawtext=${parts.join(":")}`;
 }
 
+/** The single-pass GIF palette suffix (recipe proven verbatim in vedit's
+ * build_gif, vedit.py:363-375 — never a separate palette pass): the
+ * from/to OUTPUT-timeline window (trim + renorm, BEFORE fps so the window
+ * selects retimed frames), then `fps=N,scale=W:-2:flags=lanczos` feeding
+ * `split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=
+ * dither=bayer:bayer_scale=5` — bayer dither is ordered/deterministic.
+ * Emits `…[v]`; append with `,` to a chain (or feed a labeled stream). */
+function gifPaletteChain(gif: GifExportOptions): string {
+  const t3 = (n: number) => n.toFixed(3);
+  const window: string[] = [];
+  if (gif.from !== undefined || gif.to !== undefined) {
+    const bounds: string[] = [];
+    if (gif.from !== undefined) bounds.push(`start=${t3(gif.from)}`);
+    if (gif.to !== undefined) bounds.push(`end=${t3(gif.to)}`);
+    window.push(`trim=${bounds.join(":")}`, "setpts=PTS-STARTPTS");
+  }
+  const chain = [
+    ...window,
+    `fps=${trimNum(gif.fps)}`,
+    `scale=${gif.width}:-2:flags=lanczos`,
+  ].join(",");
+  return (
+    `${chain},split[a][b];` +
+    "[a]palettegen=stats_mode=diff[p];" +
+    "[b][p]paletteuse=dither=bayer:bayer_scale=5[v]"
+  );
+}
+
 /** Single-pass transition composition (R3, validated verbatim at N=2/3/5:
  * docs/ultron/research/r3-xfade-single-pass.md). Video: chained xfade with
  * offsets O_k = Σ_{i≤k} L_i − k·D; the LAST link carries the tail chain
@@ -271,7 +319,9 @@ function drawTextFilter(o: OverlayTextOptions): string {
  * -vf path, but `setpts=PTS/s` because the chain already emits clean CFR
  * from 0). Audio (only when the source has audio): chained acrossfade, d=D
  * per join, tail [atempo][loudnorm][volume] on the last link. One
- * invocation, N inputs of the SAME source (INVARIANT 1: inputs only). */
+ * invocation, N inputs of the SAME source (INVARIANT 1: inputs only).
+ * With `opts.gif` the last link ends at [vx] and the palette suffix rides
+ * after it (audio chain omitted, `-an`). */
 function buildTransitionCommand(
   input: string,
   segments: Segment[],
@@ -304,7 +354,9 @@ function buildTransitionCommand(
         ]
       : []),
     ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
-    "format=yuv420p",
+    // yuv420p is the h264/mp4 contract — the gif palette path must not be
+    // forced into it before palettegen
+    ...(opts.gif ? [] : ["format=yuv420p"]),
   ];
 
   const links: string[] = [];
@@ -314,9 +366,12 @@ function buildTransitionCommand(
     const chain =
       `xfade=transition=${crossfade.kind}:duration=${d}:offset=${t3(offsets[k - 1]!)}` +
       (last && videoTail.length > 0 ? `,${videoTail.join(",")}` : "");
-    links.push(`[${left}][${k}:v]${chain}[${last ? "v" : `v${k}`}]`);
+    links.push(`[${left}][${k}:v]${chain}[${last ? (opts.gif ? "vx" : "v") : `v${k}`}]`);
   }
-  if (hasAudio) {
+  if (opts.gif) {
+    links.push(`[vx]${gifPaletteChain(opts.gif)}`);
+  }
+  if (hasAudio && !opts.gif) {
     const audioTail = [
       ...(speed ? [atempoChain(speed)] : []),
       ...(opts.normalizeLufs !== null
@@ -342,6 +397,10 @@ function buildTransitionCommand(
   }
   argv.push("-filter_complex", links.join(";"));
   argv.push("-map", "[v]");
+  if (opts.gif) {
+    argv.push("-an", output); // gif muxer: no audio, no h264/mov flags
+    return argv;
+  }
   if (hasAudio) {
     argv.push("-map", "[a]", "-c:a", "aac", "-b:a", opts.audioBitrate);
   } else {
@@ -365,6 +424,9 @@ function buildTransitionCommand(
  * video -vf chain stays untouched — still exactly one ffmpeg invocation.
  * `opts.crossfade` (with ≥2 segments) swaps the select composition for the
  * transition chain (N inputs + xfade/acrossfade) — also one invocation.
+ * `opts.gif` appends the palette graph after the composed video chain and
+ * muxes to the gif muxer (`-map [v] -an`, no h264/mov flags) — the select
+ * path moves into -filter_complex for it, still exactly one invocation.
  */
 export function buildRenderCommand(
   input: string,
@@ -385,6 +447,44 @@ export function buildRenderCommand(
   }
   const expr = selectExpression(segments);
   const speed = opts.speedFactor && opts.speedFactor !== 1 ? opts.speedFactor : undefined;
+
+  if (opts.gif) {
+    // render-path enforcement of the extension contract (validate also
+    // checks; this is the builder's own guard, the crossfade-refusal pattern)
+    if (!output.toLowerCase().endsWith(".gif")) {
+      fail("OUTPUT_PATH_INVALID", `export-gif: output path must end in .gif (got ${output})`);
+    }
+    if (opts.mix) {
+      // GIF carries no audio — the bed would be a silently dropped no-op
+      fail(
+        "OPERATION_INVALID",
+        "export-gif + audio-mix in one plan is not a supported composition (GIF carries no audio)",
+      );
+    }
+    const head = [
+      `select='${expr}'`,
+      `setpts=N/FRAME_RATE/TB${speed ? `/${trimNum(speed)}` : ""}`,
+      ...(opts.scaleWidth ? [`scale=${opts.scaleWidth}:${opts.scaleHeight ?? -2}`] : []),
+      ...(opts.subtitleFile
+        ? [
+            `subtitles=filename=${escapeFilterPath(opts.subtitleFile)}` +
+              (opts.subtitleStyle ? `:force_style='${escapeFilterText(opts.subtitleStyle)}'` : ""),
+          ]
+        : []),
+      ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
+      // no format=yuv420p: the palette graph owns the pixel format
+    ];
+    const graph = `[0:v]${[...head, gifPaletteChain(opts.gif)].join(",")}`;
+    return [
+      "-nostdin", "-hide_banner", "-y",
+      "-i", input,
+      "-filter_complex", graph,
+      "-map", "[v]",
+      "-an",
+      output,
+    ];
+  }
+
   const vf = [
     `select='${expr}'`,
     `setpts=N/FRAME_RATE/TB${speed ? `/${trimNum(speed)}` : ""}`,
