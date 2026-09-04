@@ -149,3 +149,125 @@ test("plan --cuts-from rejects a malformed observation file", async () => {
   assert.notEqual(r.code, 0);
   assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
 });
+
+const cliBin = () => path.resolve(import.meta.dirname, "..", "cli", "index.js");
+
+function runCli<T>(...args: string[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cliBin(), ...args]);
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d: Buffer) => (out += d));
+    child.stderr.on("data", (d: Buffer) => (err += d));
+    child.on("close", (code) => (code === 0 ? resolve(JSON.parse(out) as T) : reject(new Error(err))));
+  });
+}
+
+function runCliExpectError(...args: string[]): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cliBin(), ...args]);
+    let err = "";
+    child.stderr.on("data", (d: Buffer) => (err += d));
+    child.on("close", (code) => resolve({ code, stderr: err }));
+  });
+}
+
+const highlightReport = (cs: { start: number; end: number; score: number }[]) => ({
+  candidates: cs.map((c) => ({
+    ...c,
+    text: `moment at ${c.start}`,
+    reasons: ["test"],
+  })),
+});
+
+test("plan --highlights-from scaffolds a valid trim compilation", async () => {
+  await writeFile(
+    "highlights.json",
+    JSON.stringify(
+      highlightReport([
+        { start: 0.5, end: 2.5, score: 0.8 },
+        { start: 5.5, end: 7.5, score: 0.6 },
+        { start: 3.0, end: 3.5, score: 0.2 }, // below the min-score floor
+      ]),
+    ),
+  );
+  const plan = await runCli<{
+    operations: { type: string; start: number; end: number }[];
+    output: { path: string };
+  }>("plan", SILENCE, "--highlights-from", "highlights.json");
+  // whole-source trim replaced by the two qualifying candidates, padded 0.5s
+  assert.equal(plan.operations.length, 2, JSON.stringify(plan.operations));
+  assert.deepEqual(plan.operations[0], { type: "trim", start: 0, end: 3 });
+  const second = plan.operations[1]!;
+  assert.equal(second.type, "trim");
+  assert.ok(Math.abs(second.start - 5) < 0.01, `start ${second.start}`);
+  assert.ok(Math.abs(second.end - 8) < 0.05, `end ${second.end}`);
+
+  plan.output.path = "highlights.mp4";
+  await writeFile("highlights-plan.json", JSON.stringify(plan));
+  const v = await validatePlan("highlights-plan.json");
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  assert.ok(Math.abs((v.timelineDuration ?? 0) - 6) < 0.1, `timeline ${v.timelineDuration}`);
+});
+
+test("plan --highlights-from honors --count, --min-score and --pad", async () => {
+  await writeFile(
+    "highlights-count.json",
+    JSON.stringify(
+      highlightReport([
+        { start: 0.5, end: 2.5, score: 0.8 },
+        { start: 5.5, end: 7.5, score: 0.6 },
+        { start: 3.0, end: 3.5, score: 0.2 },
+      ]),
+    ),
+  );
+  const plan = await runCli<{ operations: { type: string; start: number; end: number }[] }>(
+    "plan",
+    SILENCE,
+    "--highlights-from",
+    "highlights-count.json",
+    "--count",
+    "1",
+    "--min-score",
+    "0.3",
+    "--pad",
+    "0",
+  );
+  // top-1 by score, no pad, floor low enough for all three candidates
+  assert.deepEqual(plan.operations, [{ type: "trim", start: 0.5, end: 2.5 }]);
+});
+
+test("plan --highlights-from with no qualifying candidate keeps the whole-source scaffold", async () => {
+  await writeFile("empty-highlights.json", JSON.stringify(highlightReport([])));
+  const plan = await runCli<{ operations: { type: string; start: number; end: number }[] }>(
+    "plan",
+    SILENCE,
+    "--highlights-from",
+    "empty-highlights.json",
+  );
+  assert.equal(plan.operations.length, 1);
+  assert.equal(plan.operations[0]!.type, "trim");
+  assert.equal(plan.operations[0]!.start, 0);
+});
+
+test("plan --highlights-from rejects a malformed highlights file", async () => {
+  await writeFile("bad-highlights.json", JSON.stringify({ segments: [] })); // silence-shaped
+  const r = await runCliExpectError("plan", SILENCE, "--highlights-from", "bad-highlights.json");
+  assert.notEqual(r.code, 0);
+  assert.ok(r.stderr.includes("OBSERVATION_INVALID"), r.stderr);
+});
+
+test("plan rejects combining both bridges", async () => {
+  await writeFile("bridge-silence.json", JSON.stringify({ segments: [] }));
+  await writeFile("bridge-highlights.json", JSON.stringify(highlightReport([])));
+  const r = await runCliExpectError(
+    "plan",
+    SILENCE,
+    "--cuts-from",
+    "bridge-silence.json",
+    "--highlights-from",
+    "bridge-highlights.json",
+  );
+  assert.notEqual(r.code, 0);
+  assert.ok(r.stderr.includes("OPERATION_INVALID"), r.stderr);
+});

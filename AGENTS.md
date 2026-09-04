@@ -23,7 +23,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 | command | args | own flags | stdout contract | cache |
 |---|---|---|---|---|
 | `inspect` | `<input>` | `--json` (raw ffprobe) | `{file, duration, video?:{codec,width,height,fps,bitrate,pixelFormat}, audio?:{codec,sampleRate,channels,bitrate}}` | metadata.json |
-| `plan` | `<input>` | `--cuts-from <silence.json> --min-duration <s=0.5> --pad <s=0.25>` | whole-source EditPlan (scaffold; agent refines) | metadata.json |
+| `plan` | `<input>` | `--cuts-from <silence.json> --min-duration <s=0.5> --pad <s=0.25>` · `--highlights-from <highlights.json> --count <n=5> --min-score <0.35> --pad <s=0.5>` (one bridge per invocation; both → `OPERATION_INVALID`) | whole-source EditPlan (scaffold; agent refines); `--highlights-from` replaces the whole-source trim with top-N highlight `trim`s (score desc, ties → earlier start; overlaps union; no qualifying candidate → whole-source scaffold unchanged) | metadata.json |
 | `validate` | `<plan>` | — | `{valid, errors[], warnings[], timelineDuration?}`; exit 0/1 | metadata.json |
 | `preview` | `<plan>` | `--force` | RenderResult (mode preview) | metadata.json |
 | `render` | `<plan>` | `--force --encoder libx264\|h264_videotoolbox --mode final\|preview` | RenderResult `{output, mode, encoder, timelineSegments, timelineDuration, outputDuration, wallMs, command[]}` | metadata.json |
@@ -46,6 +46,7 @@ Stdout = compact single-line JSON unless `--pretty`. Progress/debug/errors → s
 - **W3 speech review**: `transcribe > transcript.json` → `detect-filler transcript.json` → (agent judges which instances are dead air) → express removals as `cut` ops → W1 tail. Filler times are linear estimates within segment granularity — verify with `extract-frame --at` before cutting.
 - **W4 strategy**: `diagnose` → `benchmark` → pass `--encoder` to render accordingly.
 - **W5 MCP**: `video mcp` (or bin `video-mcp`); tools = `video_<command_snake_case>`; results identical to CLI stdout; failures = `isError:true` + `{error:{code,message,details}}`.
+- **W6 highlight compilation**: `transcribe > transcript.json` → `find-highlights <input> --transcript transcript.json > highlights.json` → `plan <input> --highlights-from highlights.json > plan.json` (tune `--count`/`--min-score`/`--pad` = the editorial decisions) → prune trims by judgment → W1 tail. Deterministic bridge per GLOSSARY; the agent decides.
 
 ## PLAN SCHEMA v1
 

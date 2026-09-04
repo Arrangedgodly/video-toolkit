@@ -42,7 +42,7 @@ const TOOLS: ToolDef[] = [
   {
     name: "video_plan",
     description:
-      "Scaffold a valid edit plan for a source. Optionally expand a silence report into cut operations.",
+      "Scaffold a valid edit plan for a source. Optionally expand a silence report into cut operations, or a highlight report into top-N trim operations (a compilation). One bridge per call.",
     inputSchema: {
       type: "object",
       properties: {
@@ -50,6 +50,9 @@ const TOOLS: ToolDef[] = [
         cuts_from: str,
         min_duration: { type: "number" },
         pad: { type: "number" },
+        highlights_from: str,
+        count: { type: "number" },
+        min_score: { type: "number" },
       },
       required: ["input"],
     },
@@ -203,6 +206,9 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
         cutsFrom: a.cuts_from !== undefined ? String(a.cuts_from) : undefined,
         minDuration: a.min_duration as number | undefined,
         pad: a.pad as number | undefined,
+        highlightsFrom: a.highlights_from !== undefined ? String(a.highlights_from) : undefined,
+        count: a.count as number | undefined,
+        minScore: a.min_score as number | undefined,
       });
     case "video_validate": {
       const r = await validatePlan(String(a.plan));

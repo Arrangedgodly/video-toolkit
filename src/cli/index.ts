@@ -52,7 +52,9 @@ plan operations: trim (keep range), cut (remove range), normalize-audio,
 
 flags: --pretty  --debug  --no-cache  --force(render)  --encoder <libx264|h264_videotoolbox>
        --mode <final|preview>(render)  --seconds N(benchmark)
-       plan: --cuts-from <silence.json> [--min-duration s] [--pad s]`;
+       plan: --cuts-from <silence.json> [--min-duration s] [--pad s] (one bridge
+             per invocation) or --highlights-from <highlights.json>
+             [--count N=5] [--min-score 0.35] [--pad s=0.5]`;
 
 interface CliFlags {
   positional: string[];
@@ -73,6 +75,7 @@ interface CliFlags {
   width?: number;
   output?: string;
   cutsFrom?: string;
+  highlightsFrom?: string;
   engine?: string;
   model?: string;
   chunk?: number;
@@ -111,6 +114,7 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--width") f.width = Number(argv[++i]);
     else if (a === "--output" || a === "-o") f.output = argv[++i];
     else if (a === "--cuts-from") f.cutsFrom = argv[++i];
+    else if (a === "--highlights-from") f.highlightsFrom = argv[++i];
     else if (a === "--engine") f.engine = argv[++i];
     else if (a === "--model") f.model = argv[++i];
     else if (a === "--chunk") f.chunk = Number(argv[++i]);
@@ -141,6 +145,9 @@ async function scaffoldPlan(input: string, f: CliFlags) {
       cutsFrom: f.cutsFrom,
       minDuration: f.minDuration,
       pad: f.pad,
+      highlightsFrom: f.highlightsFrom,
+      count: f.count,
+      minScore: f.minScore,
     }),
   );
 }

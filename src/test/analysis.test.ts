@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { parseSilenceOutput } from "../analysis/silence.js";
 import { parseSceneOutput } from "../analysis/scenes.js";
 import { silenceToCuts } from "../analysis/silence-to-cuts.js";
+import { highlightsToTrims } from "../analysis/highlights-to-trims.js";
 
 test("parseSilenceOutput pairs starts with ends in order", () => {
   const stderr = [
@@ -81,4 +82,112 @@ test("silenceToCuts drops gaps the pad fully consumes", () => {
 test("silenceToCuts with zero pad cuts exact ranges", () => {
   const cuts = silenceToCuts(report([{ s: 3, e: 5 }]), 8, { minDuration: 0.5, pad: 0 });
   assert.deepEqual(cuts, [{ type: "cut", start: 3, end: 5 }]);
+});
+
+const highlights = (cs: { s: number; e: number; score: number }[]) => ({
+  candidates: cs.map((c) => ({
+    start: c.s,
+    end: c.e,
+    score: c.score,
+    text: `segment at ${c.s}`,
+    reasons: ["test"],
+  })),
+});
+
+test("highlightsToTrims keeps the top candidates by score", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 0, e: 4, score: 0.5 },
+      { s: 6, e: 10, score: 0.9 },
+      { s: 12, e: 16, score: 0.7 },
+    ]),
+    20,
+    { count: 2, minScore: 0.35, pad: 0 },
+  );
+  assert.deepEqual(trims, [
+    { type: "trim", start: 6, end: 10 },
+    { type: "trim", start: 12, end: 16 },
+  ]);
+});
+
+test("score ties break toward the earlier candidate", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 10, e: 14, score: 0.8 },
+      { s: 0, e: 4, score: 0.8 },
+    ]),
+    20,
+    { count: 1, minScore: 0.35, pad: 0 },
+  );
+  assert.deepEqual(trims, [{ type: "trim", start: 0, end: 4 }]);
+});
+
+test("candidates below min-score are floored out", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 0, e: 4, score: 0.34 },
+      { s: 6, e: 8, score: 0.35 },
+    ]),
+    20,
+    { count: 5, minScore: 0.35, pad: 0 },
+  );
+  assert.deepEqual(trims, [{ type: "trim", start: 6, end: 8 }]);
+});
+
+test("pad expands each side and clamps to the source bounds", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 0.1, e: 1.9, score: 0.9 },
+      { s: 6, e: 7.9, score: 0.8 },
+    ]),
+    8,
+    { count: 5, minScore: 0.35, pad: 0.5 },
+  );
+  assert.deepEqual(trims, [
+    { type: "trim", start: 0, end: 2.4 },
+    { type: "trim", start: 5.5, end: 8 },
+  ]);
+});
+
+test("overlapping candidates pass through for the trim-union math", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 2, e: 6, score: 0.9 },
+      { s: 4, e: 9, score: 0.8 },
+    ]),
+    20,
+    { count: 5, minScore: 0.35, pad: 0 },
+  );
+  assert.deepEqual(trims, [
+    { type: "trim", start: 2, end: 6 },
+    { type: "trim", start: 4, end: 9 },
+  ]);
+});
+
+test("timestamps are rounded to 3 decimals", () => {
+  const trims = highlightsToTrims(
+    highlights([{ s: 1.23456, e: 2.34567, score: 0.9 }]),
+    20,
+    { count: 5, minScore: 0.35, pad: 0.111 },
+  );
+  assert.deepEqual(trims, [{ type: "trim", start: 1.124, end: 2.457 }]);
+});
+
+test("an empty highlight report yields no trims", () => {
+  assert.deepEqual(
+    highlightsToTrims({ candidates: [] }, 20, { count: 5, minScore: 0.35, pad: 0.5 }),
+    [],
+  );
+});
+
+test("candidates fully outside the source are dropped after clamping", () => {
+  const trims = highlightsToTrims(
+    highlights([
+      { s: 21, e: 25, score: 0.9 },
+      { s: 19.95, e: 21, score: 0.8 },
+    ]),
+    20,
+    { count: 5, minScore: 0.35, pad: 0.5 },
+  );
+  assert.deepEqual(trims, [{ type: "trim", start: 19.45, end: 20 }]);
 });
