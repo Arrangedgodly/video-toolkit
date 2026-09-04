@@ -240,7 +240,16 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
       });
     case "video_validate": {
       const r = await validatePlan(String(a.plan));
-      return { valid: r.valid, errors: r.errors, warnings: r.warnings, timelineDuration: r.timelineDuration };
+      return {
+        valid: r.valid,
+        errors: r.errors,
+        warnings: r.warnings,
+        timelineDuration: r.timelineDuration,
+        // crossfade plans: the fade + the adjusted expectation (CLI parity)
+        ...(r.crossfadeDuration !== undefined
+          ? { crossfadeDuration: r.crossfadeDuration, expectedDuration: r.expectedDuration }
+          : {}),
+      };
     }
     case "video_preview":
       return renderPlan(String(a.plan), { mode: "preview", force: a.force === true });

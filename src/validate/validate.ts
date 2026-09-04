@@ -3,7 +3,7 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { ToolError, fail, type ErrorCode } from "../core/errors.js";
 import { EditPlan, schemaIssues, type EditPlan as EditPlanType } from "../core/schemas.js";
-import { compileTimeline, totalDuration, type Segment } from "../core/timeline.js";
+import { adjustedDuration, compileTimeline, totalDuration, type Segment } from "../core/timeline.js";
 import { cachedInspect, type CacheOpts } from "../cache/cache.js";
 import type { MediaInfo } from "../media/ffprobe.js";
 import { OVERLAY_FONT_FILE } from "../media/ffmpeg.js";
@@ -23,6 +23,11 @@ export interface ValidationReport {
   media?: MediaInfo;
   timeline?: Segment[];
   timelineDuration?: number;
+  /** the crossfade op's fade duration, present when the plan carries one */
+  crossfadeDuration?: number;
+  /** crossfade-adjusted expectation = timelineDuration − (N−1)·fade
+   * (pre-speed; present only when a crossfade op is in the plan) */
+  expectedDuration?: number;
 }
 
 export async function loadPlan(planPath: string): Promise<EditPlanType> {
@@ -97,7 +102,8 @@ export async function validatePlan(
       op.type === "volume" ||
       op.type === "captions" ||
       op.type === "overlay-text" ||
-      op.type === "audio-mix"
+      op.type === "audio-mix" ||
+      op.type === "crossfade"
     ) {
       const first = seenTransforms.get(op.type);
       if (first !== undefined) {
@@ -173,6 +179,14 @@ export async function validatePlan(
     (op): op is Extract<(typeof plan.operations)[number], { type: "overlay-text" }> =>
       op.type === "overlay-text",
   );
+  const crossfadeOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "crossfade" }> =>
+      op.type === "crossfade",
+  );
+  const audioMixOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
+      op.type === "audio-mix",
+  );
   if ((captionsOp || overlayTextOp) && errors.length === 0) {
     const { hasFilter } = await import("../media/ffmpeg.js");
     if (captionsOp && !(await hasFilter("subtitles"))) {
@@ -207,17 +221,76 @@ export async function validatePlan(
     throw e;
   }
 
+  // crossfade bounds — CLIENT-SIDE VALIDATION IS LOAD-BEARING (R3's
+  // constraints table): ffmpeg exits 0 with silently corrupted output when
+  // the fade reaches a segment length or drops below one frame
+  if (crossfadeOp && report.timeline) {
+    const timeline = report.timeline;
+    const opIndex = plan.operations.indexOf(crossfadeOp) + 1;
+    const d = crossfadeOp.duration;
+    // nothing to transition
+    if (timeline.length < 2) {
+      errors.push({
+        code: "OPERATION_INVALID",
+        operation: opIndex,
+        message: `crossfade: timeline compiles to ${timeline.length} keep-segment; a crossfade needs at least 2`,
+      });
+    } else {
+      // floor: sub-frame fades corrupt silently (0.05 s sensible floor; never
+      // below one source frame — the stricter of the two governs)
+      const fps = media.video?.fps ?? 0;
+      const floor = Math.max(0.05, fps > 0 ? 1 / fps : 0);
+      if (d < floor) {
+        errors.push({
+          code: "OPERATION_INVALID",
+          operation: opIndex,
+          message: `crossfade: duration (${d}) is below the ${floor.toFixed(3)}s floor (sub-frame fades corrupt silently; 2 frames (${fps > 0 ? (2 / fps).toFixed(3) + "s" : "0.067s"}) is the perceptible minimum)`,
+        });
+      }
+      // fade must leave EVERY segment with positive pure content — name the
+      // offender (shortest segment) so the agent knows which trim to grow
+      let shortest = 0;
+      for (let k = 1; k < timeline.length; k++) {
+        if (timeline[k]!.end - timeline[k]!.start < timeline[shortest]!.end - timeline[shortest]!.start) {
+          shortest = k;
+        }
+      }
+      const shortestLen = timeline[shortest]!.end - timeline[shortest]!.start;
+      if (d >= shortestLen) {
+        errors.push({
+          code: "OPERATION_INVALID",
+          operation: opIndex,
+          message:
+            `crossfade: duration (${d}) must be shorter than EVERY keep-segment — ` +
+            `segment ${shortest + 1} [${timeline[shortest]!.start.toFixed(3)}, ${timeline[shortest]!.end.toFixed(3)}] is only ${shortestLen.toFixed(3)}s ` +
+            `(a fade that long silently corrupts the output; the shrinkage also has to stay ≥ 0)`,
+        });
+      }
+      // one canonical duration law feeds progress/verify + the overlay bound
+      report.crossfadeDuration = d;
+      report.expectedDuration = adjustedDuration(timeline, d);
+    }
+    // crossfade + audio-mix is not a validated composition (R3's matrix has
+    // no sidechain-ducking row) — reject rather than compose blind
+    if (audioMixOp) {
+      errors.push({
+        code: "OPERATION_INVALID",
+        operation: opIndex,
+        message: `crossfade + audio-mix in one plan is not a supported composition (the sidechain-ducking graph was never validated against the transition chain); drop one of the two`,
+      });
+    }
+  }
+
   // overlay-text `to` lives on the OUTPUT timeline — bound it by the expected
-  // output duration (timeline / speed; the same canonical expectation the
-  // render progress/verify stages use)
+  // output duration ((timeline − crossfade shrinkage) / speed; the same
+  // canonical expectation the render progress/verify stages use)
   if (overlayTextOp && overlayTextOp.to !== undefined) {
     const speedOp = plan.operations.find(
       (op): op is Extract<(typeof plan.operations)[number], { type: "speed" }> =>
         op.type === "speed",
     );
-    const expectedOutput = speedOp
-      ? (report.timelineDuration ?? 0) / speedOp.factor
-      : report.timelineDuration ?? 0;
+    const base = report.expectedDuration ?? report.timelineDuration ?? 0;
+    const expectedOutput = speedOp ? base / speedOp.factor : base;
     if (overlayTextOp.to > expectedOutput + DURATION_TOLERANCE) {
       errors.push({
         code: "OPERATION_INVALID",

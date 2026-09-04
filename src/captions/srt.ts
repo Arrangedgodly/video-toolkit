@@ -44,8 +44,22 @@ const MIN_CUE = 0.3;
  * Map a source-timed cue onto the output timeline defined by keep-segments.
  * A cue spanning a cut splits into one cue per surviving intersection; cues
  * (or fragments) shorter than MIN_CUT seconds are dropped.
+ *
+ * With `crossfadeSeconds` (a crossfade plan op, T12 outcome (a) per R3's
+ * measured remap rule): every join shrinks the output by D, so a fragment
+ * from segment j keeps its plain relative offset inside the segment and then
+ * shifts by −(j−1)·D — equivalently segment j's plain window [B(j−1), B(j)]
+ * maps to the xfade offsets [O(j−1), O(j)]. Fragments still never span a
+ * join; fragments from adjacent segments may now overlap by up to D across a
+ * fade window (both segments' content is genuinely on screen then — libass
+ * renders overlapping events correctly). Omitted/0 keeps the plain path
+ * byte-identical.
  */
-export function mapCueThroughTimeline(cue: Cue, segments: Segment[]): Cue[] {
+export function mapCueThroughTimeline(
+  cue: Cue,
+  segments: Segment[],
+  crossfadeSeconds = 0,
+): Cue[] {
   const out: Cue[] = [];
   let outputTime = 0;
   for (const seg of segments) {
@@ -59,14 +73,26 @@ export function mapCueThroughTimeline(cue: Cue, segments: Segment[]): Cue[] {
       });
     }
     outputTime += seg.end - seg.start;
+    // one shrink per join; clamped ≥ 0 so an (unvalidated) oversized fade
+    // can never make the output clock run backwards
+    if (crossfadeSeconds > 0) {
+      outputTime = Math.max(0, outputTime - crossfadeSeconds);
+    }
   }
   return out;
 }
 
-export function mapCuesThroughTimeline(cues: Cue[], segments: Segment[]): Cue[] {
-  const merged = cues.flatMap((c) => mapCueThroughTimeline(c, segments));
+export function mapCuesThroughTimeline(
+  cues: Cue[],
+  segments: Segment[],
+  crossfadeSeconds = 0,
+): Cue[] {
+  const merged = cues.flatMap((c) => mapCueThroughTimeline(c, segments, crossfadeSeconds));
   // renumber-safe: sort by start, merge same-text adjacents (cue split at a
-  // rejoining boundary would duplicate text back-to-back)
+  // rejoining boundary would duplicate text back-to-back). The 0.05 s merge
+  // window cannot wrongly merge across a join for D ≥ 0.05 (validated floor)
+  // and merging same-text fragments that both extend into a fade window
+  // keeps the text on screen through the fade — the honest rendering.
   merged.sort((a, b) => a.start - b.start);
   const out: Cue[] = [];
   for (const c of merged) {

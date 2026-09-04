@@ -32,6 +32,51 @@ test("unsupported version rejected", () => {
   assert.equal(EditPlan.safeParse({ ...base, version: 2 }).success, false);
 });
 
+// ---- crossfade op (T12; kind allowlist frozen from this build's
+// `ffmpeg -h filter=xfade` — T13's live catalog must stay a superset)
+
+test("crossfade parses with default kind fade; explicit kinds accepted", () => {
+  const p = EditPlan.parse({ ...base, operations: [{ type: "crossfade", duration: 0.5 }] });
+  const op = p.operations[0] as { type: string; duration: number; kind: string };
+  assert.equal(op.type, "crossfade");
+  assert.equal(op.duration, 0.5);
+  assert.equal(op.kind, "fade"); // schema default — always present after parse
+
+  const q = EditPlan.parse({
+    ...base,
+    operations: [{ type: "crossfade", duration: 1, kind: "circleopen" }],
+  });
+  assert.equal((q.operations[0] as { kind: string }).kind, "circleopen");
+});
+
+test("crossfade duration must be positive (and sane-max bounded)", () => {
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0 }] }).success,
+    false,
+  );
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: -0.5 }] }).success,
+    false,
+  );
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 61 }] }).success,
+    false,
+  );
+});
+
+test("crossfade kind outside the frozen allowlist rejected", () => {
+  // real xfade transitions NOT in the frozen v1 set are rejected too — the
+  // allowlist is the contract, not the build's full 58-entry enum
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "circlecrop" }] }).success,
+    false,
+  );
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "zoom" }] }).success,
+    false,
+  );
+});
+
 test("unknown operation type rejected", () => {
   assert.equal(
     EditPlan.safeParse({ ...base, operations: [{ type: "zoom", start: 0, end: 1 }] }).success,

@@ -68,6 +68,31 @@ export function totalDuration(segments: Segment[]): number {
   return segments.reduce((acc, s) => acc + (s.end - s.start), 0);
 }
 
+/** xfade offsets for the single-pass transition chain (R3, measured
+ * frame-exact): O_k = (Σ_{i≤k} L_i) − k·D for k = 1..N−1. Each O_k is BOTH
+ * the k-th xfade `offset` and the output-timeline boundary where segment
+ * k+1's content begins; the fade occupies [O_k, O_k + D]. Offsets live in
+ * the UNSCALED timeline — speed composes after the chain, so no
+ * speed-aware offset math anywhere. */
+export function xfadeOffsets(segments: Segment[], fadeSeconds: number): number[] {
+  const offsets: number[] = [];
+  let acc = 0;
+  for (let k = 0; k + 1 < segments.length; k++) {
+    acc += segments[k]!.end - segments[k]!.start;
+    offsets.push(acc - (k + 1) * fadeSeconds);
+  }
+  return offsets;
+}
+
+/** THE canonical duration law of the transition path (R3): expected output =
+ * compiled timeline − (N−1)·fade. Render progress/verify, validate's
+ * expectation, and the mix bed trim all consume this one formula. D=0 or a
+ * single segment degrade to the plain timeline total. */
+export function adjustedDuration(segments: Segment[], fadeSeconds: number): number {
+  const joins = Math.max(0, segments.length - 1);
+  return Math.max(0, totalDuration(segments) - joins * Math.max(0, fadeSeconds));
+}
+
 /** ffmpeg select expression keeping exactly these segments (proven recipe,
  * ported from vedit: select + setpts=N/FRAME_RATE/TB regenerates CFR time). */
 export function selectExpression(segments: Segment[]): string {

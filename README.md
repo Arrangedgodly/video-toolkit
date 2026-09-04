@@ -100,13 +100,14 @@ The plan declares **what to keep**, not a script: `trim` keeps a range, `cut` re
     { "type": "resize", "width": 1280 },
     { "type": "volume", "db": -3 },
     { "type": "audio-mix", "file": "bed.mp3", "level": -18,
-      "duck": { "threshold": 0.02, "ratio": 8, "attack": 20, "release": 400 } }
+      "duck": { "threshold": 0.02, "ratio": 8, "attack": 20, "release": 400 } },
+    { "type": "crossfade", "duration": 0.5, "kind": "fade" }
   ],
   "output": { "path": "output.mp4", "mode": "final" }
 }
 ```
 
-**Timeline ops** (`trim`, `cut`) select source ranges; multiple `trim`s union. **Transform ops** (`speed`, `resize`, `volume`, `normalize-audio`, `audio-mix`, `overlay-text`) apply to the whole output — at most one of each per plan — and compose into the same single pass (audio follows `speed` via an `atempo` chain; `volume` takes `db` or `factor`, exactly one). `audio-mix` layers a looping music bed under the program audio with speech-keyed sidechain ducking: `level` is bed gain in dB, and inside `duck` the `threshold` is **linear** amplitude (not dB) while `attack`/`release` are milliseconds. `overlay-text` burns a title card or lower third in the same pass — literal text with an optional `from`/`to` visibility window on the output timeline and a `position` (top/center/bottom); it uses a fixed system font (see AGENTS.md for the path and defaults).
+**Timeline ops** (`trim`, `cut`) select source ranges; multiple `trim`s union. **Transform ops** (`speed`, `resize`, `volume`, `normalize-audio`, `audio-mix`, `overlay-text`) apply to the whole output — at most one of each per plan — and compose into the same single pass (audio follows `speed` via an `atempo` chain; `volume` takes `db` or `factor`, exactly one). `audio-mix` layers a looping music bed under the program audio with speech-keyed sidechain ducking: `level` is bed gain in dB, and inside `duck` the `threshold` is **linear** amplitude (not dB) while `attack`/`release` are milliseconds. `overlay-text` burns a title card or lower third in the same pass — literal text with an optional `from`/`to` visibility window on the output timeline and a `position` (top/center/bottom); it uses a fixed system font (see AGENTS.md for the path and defaults). The **transition op** `crossfade` (at most one per plan, not combinable with `audio-mix`) joins the kept segments with fade transitions instead of hard cuts — still one FFmpeg pass; output duration shrinks by `(N−1)·duration`, the fade must be shorter than every kept segment (0.05 s floor; see AGENTS.md for the full rule table), and `video captions --plan` remaps cue times through the shrinkage so burned captions stay aligned.
 
 Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operation type means one schema case plus one compiler/validator entry — the execution engine does not change. Timestamps are seconds, everywhere, in every layer.
 

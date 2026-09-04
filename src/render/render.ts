@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { ToolError, fail, type ErrorCode } from "../core/errors.js";
 import { buildRenderCommand, channelLayoutFor, runFFmpeg, type EncoderId, type MixOptions } from "../media/ffmpeg.js";
 import { inspectFile } from "../media/ffprobe.js";
+import { adjustedDuration } from "../core/timeline.js";
 import { validatePlan } from "../validate/validate.js";
 import type { CacheOpts } from "../cache/cache.js";
 
@@ -117,6 +118,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
       op.type === "audio-mix",
   );
+  const crossfadeOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "crossfade" }> =>
+      op.type === "crossfade",
+  );
   const hasAudio = report.media.audio != null;
   const speedFactor = speedOp?.factor;
 
@@ -132,12 +137,15 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     }
   }
 
-  // expected output duration = timeline / speed; the mix bed's atrim bound
-  // needs it before the command is built (R1 record: atrim is the determinism
-  // bound on the looped bed)
-  const expectedDuration = speedFactor
-    ? report.timelineDuration / speedFactor
+  // expected output duration = (timeline − crossfade shrinkage) / speed — the
+  // ONE canonical expectation (R3's duration law, consumed by T8's
+  // verify-warning fix and the mix bed's atrim bound alike). A crossfade plan
+  // is shorter by (N−1)·fade; comparing against the raw timeline would warn
+  // spuriously.
+  const baseDuration = crossfadeOp
+    ? adjustedDuration(report.timeline, crossfadeOp.duration)
     : report.timelineDuration;
+  const expectedDuration = speedFactor ? baseDuration / speedFactor : baseDuration;
 
   // mix plumbing is pure declaration: bed file + level + duck params, the
   // atrim bound, and the speech stream's OWN rate/layout from the already-
@@ -197,6 +205,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
           }
         : undefined,
       mix,
+      // transition chain (R3): validated plans carry ≥2 segments here
+      crossfade: crossfadeOp
+        ? { duration: crossfadeOp.duration, kind: crossfadeOp.kind }
+        : undefined,
     },
     hasAudio,
   );

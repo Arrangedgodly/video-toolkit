@@ -231,6 +231,11 @@ async function main(): Promise<void> {
         errors: r.errors,
         warnings: r.warnings,
         timelineDuration: r.timelineDuration,
+        // present only when the plan carries a crossfade: the fade and the
+        // adjusted expectation (timeline − (N−1)·fade; pre-speed)
+        ...(r.crossfadeDuration !== undefined
+          ? { crossfadeDuration: r.crossfadeDuration, expectedDuration: r.expectedDuration }
+          : {}),
       });
       process.exitCode = r.valid ? 0 : 1;
       return;

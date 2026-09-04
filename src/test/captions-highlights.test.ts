@@ -70,6 +70,115 @@ test("mapCues merges same-text fragments that rejoin at a boundary", () => {
   assert.deepEqual(out, [{ start: 8, end: 12, text: "joined" }]);
 });
 
+// ---- crossfade remap honesty (T12 outcome (a), per R3's measurement:
+// plain cues drift late by exactly (j−1)·D; the shift restores alignment)
+
+const CF_SEGS = [
+  { start: 1, end: 4 },
+  { start: 5.5, end: 9 },
+  { start: 11, end: 14.5 },
+];
+const CF_D = 0.5;
+
+test("crossfade remap: a cue in segment j shifts by exactly −(j−1)·D", () => {
+  // cue anchored at the HEAD of each segment (source time), plain output
+  // heads are 0 / 3.0 / 6.5; adjusted heads must be the xfade offsets 0 / 2.5 / 5.5
+  const cues = [
+    { start: 1.2, end: 2.4, text: "one" },
+    { start: 5.7, end: 6.9, text: "two" },
+    { start: 11.2, end: 12.4, text: "three" },
+  ];
+  const round = (cs: { start: number; end: number; text: string }[]) =>
+    cs.map((c) => ({
+      start: Math.round(c.start * 1e9) / 1e9,
+      end: Math.round(c.end * 1e9) / 1e9,
+      text: c.text,
+    }));
+  assert.deepEqual(round(mapCuesThroughTimeline(cues, CF_SEGS, CF_D)), [
+    { start: 0.2, end: 1.4, text: "one" },   // j=1: no shift
+    { start: 2.7, end: 3.9, text: "two" },   // j=2: −0.5
+    { start: 5.7, end: 6.9, text: "three" }, // j=3: −1.0
+  ]);
+});
+
+test("crossfade remap: segment j's plain window maps onto the xfade offsets exactly", () => {
+  // the fragment covering segment j's full content maps its START to O(j−1)
+  // and its content end (O_j) is exactly where the next segment's content
+  // begins — the offset formula and the remap agree by construction
+  const full = mapCueThroughTimeline(
+    { start: 5.5, end: 9, text: "seg2" },
+    CF_SEGS,
+    CF_D,
+  );
+  assert.deepEqual(full, [{ start: 2.5, end: 6.0, text: "seg2" }]); // [O1, O1+L2]
+  // segment 3's head lands exactly at O2 (its content boundary)
+  const head = mapCueThroughTimeline({ start: 11, end: 12, text: "seg3head" }, CF_SEGS, CF_D);
+  assert.equal(head[0]!.start, 5.5); // == xfadeOffsets(CF_SEGS, CF_D)[1]
+});
+
+test("crossfade remap: fragments never span a join (split rules unchanged)", () => {
+  // DIFFERENT texts so the same-text merge cannot hide the fragment shape:
+  // segment 1's tail cue and segment 2's head cue each stay inside their own
+  // segment; the shift makes them overlap by exactly D across the fade
+  // window — both segments' content is on screen during [O_k, O_k+D], so
+  // both cues are simultaneously true (libass renders overlaps correctly)
+  const out = mapCuesThroughTimeline(
+    [
+      { start: 3, end: 4, text: "tail" },
+      { start: 5.5, end: 6, text: "head" },
+    ],
+    CF_SEGS,
+    CF_D,
+  );
+  assert.deepEqual(out, [
+    { start: 2.0, end: 3.0, text: "tail" }, // plain [2,3], no shift
+    { start: 2.5, end: 3.0, text: "head" }, // plain [3,3.5] − 0.5
+  ]);
+  const overlap = out[1]!.start - out[0]!.end;
+  assert.ok(overlap < 0 && Math.abs(overlap) <= CF_D, `overlap ${overlap}`);
+});
+
+test("crossfade remap: same-text fragments across a join merge (text rides the fade)", () => {
+  // one cue spanning the source gap [4,5.5]: the cut already leaves adjacent
+  // plain fragments ([2,3] + [3,3.5] — seg2's plain window starts at 3.0) and
+  // the existing 0.05 s merge reunites them; the crossfade shift pulls seg2's
+  // fragment 0.5 s earlier, so the merged window shrinks with the timeline —
+  // the text stays on screen exactly as long as its content does
+  const plain = mapCuesThroughTimeline([{ start: 3, end: 6, text: "spans" }], CF_SEGS);
+  assert.deepEqual(plain, [{ start: 2.0, end: 3.5, text: "spans" }]);
+  const faded = mapCuesThroughTimeline([{ start: 3, end: 6, text: "spans" }], CF_SEGS, CF_D);
+  const f = faded[0]!;
+  assert.equal(faded.length, 1);
+  assert.ok(Math.abs(f.start - 2.0) < 1e-9 && Math.abs(f.end - 3.0) < 1e-9, JSON.stringify(faded));
+});
+
+test("crossfade remap: MIN_CUE drop rule unchanged; crossfade arg 0 = plain path", () => {
+  // a 0.2 s fragment still drops after shifting
+  const short = mapCueThroughTimeline({ start: 13.9, end: 14.1, text: "tiny" }, CF_SEGS, CF_D);
+  assert.deepEqual(short, []);
+  // byte-identity lock: omitted arg and explicit 0 produce identical lists
+  const cues = [
+    { start: 2, end: 6, text: "a" },
+    { start: 6, end: 13, text: "b" },
+    { start: 13, end: 14.2, text: "c" },
+  ];
+  const plain = mapCuesThroughTimeline(cues, CF_SEGS);
+  assert.deepEqual(mapCuesThroughTimeline(cues, CF_SEGS, 0), plain);
+});
+
+test("crossfade remap: head fragments stay ordered and non-negative", () => {
+  // every remapped cue starts ≥ 0 and the list stays sorted by start —
+  // the output clock never runs backwards even at the first join
+  const cues = [
+    { start: 0, end: 14.5, text: "everything" },
+    { start: 13, end: 14.4, text: "tail" },
+  ];
+  const out = mapCuesThroughTimeline(cues, CF_SEGS, CF_D);
+  for (const c of out) assert.ok(c.start >= 0 && c.end > c.start, JSON.stringify(out));
+  const starts = out.map((c) => c.start);
+  assert.deepEqual([...starts].sort((a, b) => a - b), starts);
+});
+
 // ---- vtt (WebVTT variant: same cue math, WebVTT serialization)
 
 test("formatVttTime pads and uses dot milliseconds", () => {

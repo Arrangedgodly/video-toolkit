@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EditPlan } from "../core/schemas.js";
-import { atempoChain, buildRenderCommand, escapeDrawText, type MixOptions } from "../media/ffmpeg.js";
+import { atempoChain, buildRenderCommand, escapeDrawText, escapeFilterPath, type MixOptions } from "../media/ffmpeg.js";
 
 const base = {
   version: 1,
@@ -293,4 +293,158 @@ test("builder: overlay-text positions map to y expressions; box off; custom font
   assert.ok(vf.includes("fontcolor=0xFFCC00"), vf);
   assert.ok(!vf.includes("box="), vf);
   assert.ok(vf.includes("x=(w-text_w)/2"), vf);
+});
+
+// ---- crossfade (transition chain template: docs/ultron/research/
+// r3-xfade-single-pass.md — N -ss/-t inputs + chained xfade/acrossfade,
+// speed/scale/subtitles/overlay AFTER the chain, ONE invocation)
+
+test("builder: crossfade N=2 emits the validated transition graph verbatim", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  assert.deepEqual(argv, [
+    "-nostdin", "-hide_banner", "-y",
+    "-ss", "0.000", "-t", "3.000", "-i", "in.mp4",
+    "-ss", "5.000", "-t", "3.500", "-i", "in.mp4",
+    "-filter_complex",
+    "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=2.500,format=yuv420p[v];" +
+      "[0:a][1:a]acrossfade=d=0.500[a]",
+    "-map", "[v]", "-map", "[a]",
+    "-c:a", "aac", "-b:a", "192k",
+    "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+    "-movflags", "+faststart", "out.mp4",
+  ]);
+  // no select/-vf/-af anywhere — this is the alternative composition
+  assert.equal(argv.includes("-vf"), false);
+  assert.equal(argv.includes("-af"), false);
+  assert.equal(argv.includes("select="), false);
+});
+
+test("builder: crossfade N=3 (R3's exact fixture) — offsets, kind, tails", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 1, end: 4 }, { start: 5.5, end: 9 }, { start: 11, end: 14.5 }],
+    "out.mp4",
+    {
+      ...opts,
+      speedFactor: 2,
+      normalizeLufs: -16,
+      volumeDb: -6,
+      scaleWidth: 640,
+      subtitleFile: "subs.srt",
+      subtitleStyle: "FontSize=24",
+      crossfade: { duration: 0.5, kind: "wiperight" },
+    },
+    true,
+  );
+  // three inputs of the SAME source, exact -ss/-t windows
+  const inputs: string[][] = [];
+  for (let i = argv.indexOf("-i"); i !== -1; i = argv.indexOf("-i", i + 1)) {
+    inputs.push(argv.slice(i - 4, i + 2));
+  }
+  assert.deepEqual(inputs, [
+    ["-ss", "1.000", "-t", "3.000", "-i", "in.mp4"],
+    ["-ss", "5.500", "-t", "3.500", "-i", "in.mp4"],
+    ["-ss", "11.000", "-t", "3.500", "-i", "in.mp4"],
+  ]);
+
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.equal(
+    graph,
+    // offsets O1=2.5, O2=5.5 (R3 outB); the LAST xfade carries the video
+    // tail: setpts (PTS/s — NOT N/FRAME_RATE/TB) → scale → subtitles → format
+    "[0:v][1:v]xfade=transition=wiperight:duration=0.500:offset=2.500[v1];" +
+      "[v1][2:v]xfade=transition=wiperight:duration=0.500:offset=5.500," +
+      "setpts=PTS/2,scale=640:-2,subtitles=filename=" + escapeFilterPath("subs.srt") +
+      ":force_style='FontSize=24',format=yuv420p[v];" +
+      // audio: chained acrossfade (d=D per join), tail on the last link
+      "[0:a][1:a]acrossfade=d=0.500[a1];" +
+      "[a1][2:a]acrossfade=d=0.500,atempo=2,loudnorm=I=-16:TP=-1.5:LRA=11,volume=-6dB[a]",
+    graph,
+  );
+  assert.deepEqual(
+    argv.slice(argv.indexOf("-map"), argv.indexOf("-map") + 4),
+    ["-map", "[v]", "-map", "[a]"],
+  );
+});
+
+test("builder: crossfade on an audio-less source is video-only (-an, no acrossfade)", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, crossfade: { duration: 0.5, kind: "fade" } },
+    false,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.equal(graph, "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=2.500,format=yuv420p[v]");
+  assert.equal(argv.includes("acrossfade"), false);
+  assert.equal(argv.includes("[a]"), false);
+  assert.deepEqual(
+    argv.slice(argv.indexOf("-map"), argv.indexOf("-map") + 2),
+    ["-map", "[v]"],
+  );
+  assert.ok(argv.includes("-an"), argv.join(" "));
+});
+
+test("builder: crossfade + overlay-text composes after the chain (drawtext)", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, overlayText: overlay, crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  const iDraw = graph.indexOf("drawtext=");
+  const iFmt = graph.indexOf("format=yuv420p");
+  assert.ok(iDraw !== -1 && iDraw < iFmt, graph);
+  assert.ok(graph.includes("text=Hello World"), graph);
+});
+
+test("builder: crossfade refuses the unvalidated audio-mix composition", () => {
+  assert.throws(
+    () =>
+      buildRenderCommand(
+        "in.mp4",
+        [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+        "out.mp4",
+        { ...opts, mix, crossfade: { duration: 0.5, kind: "fade" } },
+        true,
+      ),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+});
+
+test("builder: crossfade with <2 segments is refused (validate's rule, never a silent no-op)", () => {
+  assert.throws(
+    () =>
+      buildRenderCommand(
+        "in.mp4",
+        [{ start: 0, end: 3 }],
+        "out.mp4",
+        { ...opts, crossfade: { duration: 0.5, kind: "fade" } },
+        true,
+      ),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+});
+
+test("builder: without crossfade the select path is unchanged (no -filter_complex)", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    opts,
+    true,
+  );
+  assert.equal(argv.filter((a) => a === "-i").length, 1);
+  assert.equal(argv.includes("-filter_complex"), false);
+  assert.ok(argv[argv.indexOf("-vf") + 1]!.startsWith("select='between(t,0.000,3.000)+"), argv.join(" "));
+  assert.notEqual(argv.indexOf("-af"), -1);
 });

@@ -73,7 +73,10 @@ export async function generateCaptions(
     const plan = await loadPlan(opts.plan);
     const media = await cachedInspect(plan.source, opts);
     const timeline = compileTimeline(plan.operations, media.duration);
-    const mapped = mapCuesThroughTimeline(sourceCues, timeline);
+    // a crossfade op shrinks every join by its duration — the remap must
+    // shift with it or burned cues run late by (j−1)·D (T12 outcome (a))
+    const crossfadeOp = plan.operations.find((op) => op.type === "crossfade");
+    const mapped = mapCuesThroughTimeline(sourceCues, timeline, crossfadeOp?.duration);
     const keptText = new Set(mapped.map((c) => c.text));
     dropped = sourceCues.filter((c) => !keptText.has(c.text)).length;
     cues = mapped;

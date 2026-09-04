@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fail } from "../core/errors.js";
-import { selectExpression, totalDuration, type Segment } from "../core/timeline.js";
+import { selectExpression, totalDuration, xfadeOffsets, type Segment } from "../core/timeline.js";
 
 export type EncoderId = "libx264" | "h264_videotoolbox";
 
@@ -73,6 +73,22 @@ export interface RenderOptions {
    * audio with speech-keyed sidechain ducking — still one ffmpeg pass
    * (graph validated in docs/ultron/research/r1-audio-mix-single-pass.md) */
   mix?: MixOptions | null;
+  /** when set, join the keep-segments with crossfade transitions instead of
+   * hard cuts: N `-ss/-t -i <source>` inputs + chained xfade/acrossfade in
+   * ONE invocation (graph validated in docs/ultron/research/
+   * r3-xfade-single-pass.md). Requires ≥2 segments and
+   * duration < every segment length (validate enforces both). */
+  crossfade?: CrossfadeOptions;
+}
+
+/** One crossfade transition declaration (plan op `crossfade`). Offsets are
+ * computed in the UNSCALED timeline; speed/scale/subtitles/overlay compose
+ * AFTER the chain (R3's composition findings). */
+export interface CrossfadeOptions {
+  /** fade duration per join (s) */
+  duration: number;
+  /** xfade transition name (schema-frozen allowlist; default "fade") */
+  kind: string;
 }
 
 /** One burned text overlay (plan op `overlay-text`; defaults applied by the
@@ -248,6 +264,98 @@ function drawTextFilter(o: OverlayTextOptions): string {
   return `drawtext=${parts.join(":")}`;
 }
 
+/** Single-pass transition composition (R3, validated verbatim at N=2/3/5:
+ * docs/ultron/research/r3-xfade-single-pass.md). Video: chained xfade with
+ * offsets O_k = Σ_{i≤k} L_i − k·D; the LAST link carries the tail chain
+ * (speed → scale → subtitles → overlay → format — the same order as the
+ * -vf path, but `setpts=PTS/s` because the chain already emits clean CFR
+ * from 0). Audio (only when the source has audio): chained acrossfade, d=D
+ * per join, tail [atempo][loudnorm][volume] on the last link. One
+ * invocation, N inputs of the SAME source (INVARIANT 1: inputs only). */
+function buildTransitionCommand(
+  input: string,
+  segments: Segment[],
+  output: string,
+  opts: RenderOptions,
+  hasAudio: boolean,
+  crossfade: CrossfadeOptions,
+): string[] {
+  if (opts.mix) {
+    // validated combinations only — validate.ts rejects this plan; the
+    // builder refuses rather than silently dropping the bed
+    fail(
+      "OPERATION_INVALID",
+      "crossfade + audio-mix in one plan is not a supported composition",
+    );
+  }
+  const speed = opts.speedFactor && opts.speedFactor !== 1 ? opts.speedFactor : undefined;
+  const t3 = (n: number) => n.toFixed(3);
+  const d = t3(crossfade.duration);
+  const offsets = xfadeOffsets(segments, crossfade.duration);
+  const n = segments.length;
+
+  const videoTail = [
+    ...(speed ? [`setpts=PTS/${trimNum(speed)}`] : []),
+    ...(opts.scaleWidth ? [`scale=${opts.scaleWidth}:${opts.scaleHeight ?? -2}`] : []),
+    ...(opts.subtitleFile
+      ? [
+          `subtitles=filename=${escapeFilterPath(opts.subtitleFile)}` +
+            (opts.subtitleStyle ? `:force_style='${escapeFilterText(opts.subtitleStyle)}'` : ""),
+        ]
+      : []),
+    ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
+    "format=yuv420p",
+  ];
+
+  const links: string[] = [];
+  for (let k = 1; k < n; k++) {
+    const left = k === 1 ? "0:v" : `v${k - 1}`;
+    const last = k === n - 1;
+    const chain =
+      `xfade=transition=${crossfade.kind}:duration=${d}:offset=${t3(offsets[k - 1]!)}` +
+      (last && videoTail.length > 0 ? `,${videoTail.join(",")}` : "");
+    links.push(`[${left}][${k}:v]${chain}[${last ? "v" : `v${k}`}]`);
+  }
+  if (hasAudio) {
+    const audioTail = [
+      ...(speed ? [atempoChain(speed)] : []),
+      ...(opts.normalizeLufs !== null
+        ? [`loudnorm=I=${opts.normalizeLufs}:TP=-1.5:LRA=11`]
+        : []),
+      ...(opts.volumeDb !== null && opts.volumeDb !== undefined
+        ? [`volume=${trimNum(opts.volumeDb)}dB`]
+        : []),
+    ];
+    for (let k = 1; k < n; k++) {
+      const left = k === 1 ? "0:a" : `a${k - 1}`;
+      const last = k === n - 1;
+      const chain =
+        `acrossfade=d=${d}` +
+        (last && audioTail.length > 0 ? `,${audioTail.join(",")}` : "");
+      links.push(`[${left}][${k}:a]${chain}[${last ? "a" : `a${k}`}]`);
+    }
+  }
+
+  const argv = ["-nostdin", "-hide_banner", "-y"];
+  for (const seg of segments) {
+    argv.push("-ss", t3(seg.start), "-t", t3(seg.end - seg.start), "-i", input);
+  }
+  argv.push("-filter_complex", links.join(";"));
+  argv.push("-map", "[v]");
+  if (hasAudio) {
+    argv.push("-map", "[a]", "-c:a", "aac", "-b:a", opts.audioBitrate);
+  } else {
+    argv.push("-an");
+  }
+  if (opts.encoder === "libx264") {
+    argv.push("-c:v", "libx264", "-crf", String(opts.crf), "-preset", opts.preset);
+  } else {
+    argv.push("-c:v", "h264_videotoolbox", "-b:v", opts.videoBitrate, "-realtime", "0");
+  }
+  argv.push("-movflags", "+faststart", output);
+  return argv;
+}
+
 /**
  * Build the single-pass render command for a compiled timeline.
  * All trims/cuts become one select filter over the source — no intermediate
@@ -255,6 +363,8 @@ function drawTextFilter(o: OverlayTextOptions): string {
  * (speed/resize/volume) compose into the same single pass; `opts.mix` moves
  * the audio chain into -filter_complex (sidechain ducking + amix) while the
  * video -vf chain stays untouched — still exactly one ffmpeg invocation.
+ * `opts.crossfade` (with ≥2 segments) swaps the select composition for the
+ * transition chain (N inputs + xfade/acrossfade) — also one invocation.
  */
 export function buildRenderCommand(
   input: string,
@@ -263,6 +373,16 @@ export function buildRenderCommand(
   opts: RenderOptions,
   hasAudio: boolean,
 ): string[] {
+  if (opts.crossfade) {
+    if (segments.length < 2) {
+      // validate rejects this before render; never a silent no-op
+      fail(
+        "OPERATION_INVALID",
+        `crossfade needs at least 2 keep-segments (got ${segments.length})`,
+      );
+    }
+    return buildTransitionCommand(input, segments, output, opts, hasAudio, opts.crossfade);
+  }
   const expr = selectExpression(segments);
   const speed = opts.speedFactor && opts.speedFactor !== 1 ? opts.speedFactor : undefined;
   const vf = [

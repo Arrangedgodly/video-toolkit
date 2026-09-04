@@ -111,6 +111,44 @@ export const AudioMixOp = z.object({
   duck: AudioMixDuck.optional(),
 });
 
+/** Crossfade transition kind — a FROZEN allowlist drawn from this build's
+ * `ffmpeg -h filter=xfade` enum (all verified present on ffmpeg 9.0.1
+ * ffmpeg-full; T13's live-parsed catalog must remain a superset). `fade` is
+ * the only empirically validated kind (docs/ultron/research/
+ * r3-xfade-single-pass.md); every kind shares the same duration/offset
+ * semantics. */
+export const CROSSFADE_KINDS = [
+  "fade",
+  "fadeblack",
+  "fadewhite",
+  "wipeleft",
+  "wiperight",
+  "wipeup",
+  "wipedown",
+  "slideleft",
+  "slideright",
+  "slideup",
+  "slidedown",
+  "dissolve",
+  "circleopen",
+  "circleclose",
+  "radial",
+] as const;
+
+/** Join consecutive keep-segments with crossfade transitions (video `xfade` +
+ * audio `acrossfade`), still in ONE ffmpeg pass (INVARIANT 1 — R3's validated
+ * chain). TIMELINE-affecting: output duration = timeline − (N−1)·duration.
+ * Client-side bounds are load-bearing — ffmpeg silently corrupts when the
+ * fade reaches a segment length or drops below one frame. */
+export const CrossfadeOp = z.object({
+  type: z.literal("crossfade"),
+  /** fade duration per join, seconds (> 0; validate enforces the real
+   * floor: ≥ 0.05 s and ≥ one source frame, and < EVERY keep-segment) */
+  duration: z.number().gt(0).max(60),
+  /** xfade transition name; default "fade" */
+  kind: z.enum(CROSSFADE_KINDS).default("fade"),
+});
+
 /** Transform ops apply to the whole output; they never affect which source
  * ranges are kept (that stays the trim/cut pair). At most one of each. */
 export type TransformOpType =
@@ -131,6 +169,7 @@ export const Operation = z.discriminatedUnion("type", [
   CaptionsOp,
   OverlayTextOp,
   AudioMixOp,
+  CrossfadeOp,
 ]);
 
 export const OutputSpec = z.object({
