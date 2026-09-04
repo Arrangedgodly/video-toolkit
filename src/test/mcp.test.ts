@@ -124,9 +124,11 @@ test("tools/call: transitions returns the live xfade catalog (CLI parity)", asyn
   assert.ok(Array.isArray(data.transitions) && data.transitions.length > 0);
   assert.equal(data.count, data.transitions.length);
   assert.ok(data.ffmpeg.length > 0);
-  // every frozen crossfade kind must be discoverable here (T13's superset law)
+  // the catalog IS the allowlist on this build (T17 equality era — every
+  // allowlisted kind discoverable AND nothing beyond it)
+  assert.equal(data.count, CROSSFADE_KINDS.length);
   const kinds = new Set(data.transitions.map((t) => t.kind));
-  for (const k of CROSSFADE_KINDS) assert.ok(kinds.has(k), `catalog missing frozen kind ${k}`);
+  for (const k of CROSSFADE_KINDS) assert.ok(kinds.has(k), `catalog missing allowlisted kind ${k}`);
 });
 
 test("tools/call: inspect returns the fixture facts", async () => {

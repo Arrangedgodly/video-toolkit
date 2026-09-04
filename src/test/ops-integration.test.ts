@@ -7,6 +7,7 @@ import { runCapture, inspectFile } from "../media/ffprobe.js";
 import { validatePlan } from "../validate/validate.js";
 import { renderPlan } from "../render/render.js";
 import { generateCaptions } from "../captions/generate.js";
+import { CROSSFADE_KINDS } from "../core/schemas.js";
 
 const FIXTURE = "fixture.mp4"; // 12s, 1280x720, 440Hz tone
 const SPEECH = "speech-gated.mp4"; // 12s, 3kHz bursts: 2.5s on / 1.5s off
@@ -15,6 +16,8 @@ const NOAUDIO = "noaudio.mp4"; // 3s video-only
 const BLACK = "black.mp4"; // 2s solid black, video-only — overlay visibility probe
 const BLOCKS = "blocks.mp4"; // 15s, 640x360@30: red[0,5)+440Hz, green[5,10)+880Hz,
 //                            blue[10,15)+1320Hz — R3's transition fixture shape
+const XFK = "xfk.mp4"; // 2.6s, 320x180@25: red[0,1.3)+440Hz, green[1.3,2.6)+880Hz
+//                      — T17's tiny kind-sweep fixture (2 keep-segments via a cut)
 let dir = "";
 
 before(async () => {
@@ -79,6 +82,23 @@ before(async () => {
     "-c:a", "aac", "-b:a", "128k", BLOCKS,
   ]);
   assert.equal(r6.code, 0, r6.stderr);
+
+  // T17 sweep fixture: the SMALLEST honest crossfade source — 320x180@25 with
+  // distinct tones. Keeps = trim[0,2.6] − cut[1.2,1.4] = two 1.2s segments
+  // (ADJACENT trims would union into one — the cut enforces the gap); D=0.12
+  // (3 frames, ≥ the 2-frame floor) → expected output 2.4 − 0.12 = 2.28s
+  const r7 = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=c=0xC00000:s=320x180:r=25:d=1.3",
+    "-f", "lavfi", "-i", "color=c=0x00A000:s=320x180:r=25:d=1.3",
+    "-f", "lavfi", "-i", "sine=f=440:r=44100:d=1.3",
+    "-f", "lavfi", "-i", "sine=f=880:r=44100:d=1.3",
+    "-filter_complex", "[0:v][2:a][1:v][3:a]concat=n=2:v=1:a=1[v][a]",
+    "-map", "[v]", "-map", "[a]",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", XFK,
+  ]);
+  assert.equal(r7.code, 0, r7.stderr);
 });
 
 after(async () => {
@@ -687,4 +707,94 @@ test("crossfade validation: overlay-text bound consumes the crossfade-adjusted e
     { type: "overlay-text", text: "x", to: 8.9 },
   ])));
   assert.equal(good.valid, true, JSON.stringify(good.errors));
+});
+
+// ---- T17: full-allowlist verification sweep — EVERY catalog kind renders on
+// the tiny XFK fixture (2 keep-segments, 320x180@25, D=0.12). Per kind: exit
+// 0 (renderPlan throws FFMPEG_FAILED otherwise), ONE -filter_complex, the
+// kind actually in the xfade graph, the duration law (timeline − (N−1)·fade
+// within ONE frame at 25 fps = 0.04s), a decodable output (ffprobe). Preview
+// mode rides the same single-invocation transition chain at preview settings
+// (~0.4 s per render, measured). All kinds attempted even when one fails —
+// failures name their kind. One serial warm render first (the metadata cache
+// write is not concurrency-safe), then bounded 4-way parallelism.
+
+test("crossfade T17 sweep: EVERY allowlisted kind renders — exit 0, one pass, duration law, decodable", async () => {
+  const kinds = [...CROSSFADE_KINDS];
+  assert.equal(kinds.length, 58, "the pinned build's verified allowlist");
+  interface Row {
+    kind: string;
+    duration?: number;
+    decodable?: boolean;
+    kindInGraph?: boolean;
+    onePass?: boolean;
+    error?: string;
+  }
+  const rows: Row[] = [];
+  const renderKind = async (kind: string): Promise<void> => {
+    const planPath = await writePlan(`xfk-${kind}.json`, {
+      version: 1,
+      source: XFK,
+      operations: [
+        { type: "trim", start: 0, end: 2.6 },
+        { type: "cut", start: 1.2, end: 1.4 },
+        { type: "crossfade", duration: 0.12, kind },
+      ],
+      output: { path: `xfk-${kind}.mp4` },
+    });
+    try {
+      const r = await renderPlan(planPath, { mode: "preview" });
+      const info = await inspectFile(r.output);
+      const cmd = r.command.join(" ");
+      rows.push({
+        kind,
+        duration: r.outputDuration,
+        decodable: info.video != null,
+        kindInGraph: cmd.includes(`xfade=transition=${kind}:duration=0.120:offset=1.080`),
+        onePass: r.command.filter((a) => a === "-filter_complex").length === 1,
+      });
+    } catch (e) {
+      const err = e as { code?: string; message?: string };
+      rows.push({ kind, error: `${err.code ?? "ERROR"}: ${String(err.message).slice(0, 120)}` });
+    }
+  };
+
+  await renderKind(kinds[0]!); // warm the source metadata cache serially
+  const queue = kinds.slice(1);
+  let cursor = 0;
+  const lane = async (): Promise<void> => {
+    while (cursor < queue.length) await renderKind(queue[cursor++]!);
+  };
+  await Promise.all([lane(), lane(), lane(), lane()]);
+
+  assert.equal(rows.length, kinds.length, "every kind attempted exactly once");
+  const failures: string[] = [];
+  for (const row of rows) {
+    const problems: string[] = [];
+    if (row.error) problems.push(`render failed: ${row.error}`);
+    if (!row.kindInGraph) problems.push("kind missing from the xfade graph");
+    if (!row.onePass) problems.push("not one -filter_complex invocation (INVARIANT 1)");
+    if (row.duration === undefined || Math.abs(row.duration - 2.28) > 1 / 25) {
+      problems.push(`duration ${row.duration} violates the law (2.28 ± one frame)`);
+    }
+    if (!row.decodable) problems.push("no decodable video stream (ffprobe)");
+    if (problems.length > 0) failures.push(`${row.kind}: ${problems.join("; ")}`);
+  }
+  assert.deepEqual(failures, [], `T17 sweep — all ${kinds.length} kinds must verify`);
+});
+
+test("crossfade: kind 'custom' parses at schema level but is fenced — OPERATION_INVALID naming expr=", async () => {
+  const p = await writePlan("xfc.json", xfPlan([
+    ...XF_TRIMS,
+    { type: "crossfade", duration: 0.5, kind: "custom" },
+  ]));
+  const r = await validatePlan(p);
+  assert.equal(r.valid, false);
+  assert.equal(r.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(r.errors[0]?.message.includes("expr="), r.errors[0]?.message);
+  // the fence holds on the render path too (render re-validates)
+  await assert.rejects(
+    () => renderPlan(p),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
 });

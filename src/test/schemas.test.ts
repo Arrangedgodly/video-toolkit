@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { EditPlan } from "../core/schemas.js";
+import { CROSSFADE_KINDS, EditPlan } from "../core/schemas.js";
+import { parseXfadeTransitions } from "../media/transitions.js";
+import { XFADE_HELP_FIXTURE } from "./xfade-help-fixture.js";
 
 const base = {
   version: 1,
@@ -32,8 +34,20 @@ test("unsupported version rejected", () => {
   assert.equal(EditPlan.safeParse({ ...base, version: 2 }).success, false);
 });
 
-// ---- crossfade op (T12; kind allowlist frozen from this build's
-// `ffmpeg -h filter=xfade` — T13's live catalog must stay a superset)
+// ---- crossfade op (T12 landed the op; T17 widened the kind allowlist to the
+// FULL verified catalog — equality with `ffmpeg -h filter=xfade` is enforced
+// below against the committed fixture; `custom` parses only to be fenced)
+
+test("crossfade allowlist EQUALS the committed fixture's catalog parse (T17, both directions)", () => {
+  // deepEqual is bidirectional: no allowlisted kind missing from the catalog,
+  // no catalog kind missing from the allowlist — and the ORDER (help listing)
+  // is pinned too, so drift in either direction fails loudly
+  assert.deepEqual([...CROSSFADE_KINDS], parseXfadeTransitions(XFADE_HELP_FIXTURE));
+  assert.equal(CROSSFADE_KINDS.length, 58);
+  // the `custom` sentinel is not a kind: excluded from the allowlist AND from
+  // the catalog parse (enum value −1, needs expr=)
+  assert.equal(CROSSFADE_KINDS.includes("custom" as (typeof CROSSFADE_KINDS)[number]), false);
+});
 
 test("crossfade parses with default kind fade; explicit kinds accepted", () => {
   const p = EditPlan.parse({ ...base, operations: [{ type: "crossfade", duration: 0.5 }] });
@@ -42,11 +56,19 @@ test("crossfade parses with default kind fade; explicit kinds accepted", () => {
   assert.equal(op.duration, 0.5);
   assert.equal(op.kind, "fade"); // schema default — always present after parse
 
+  // T12 kinds stay accepted…
   const q = EditPlan.parse({
     ...base,
     operations: [{ type: "crossfade", duration: 1, kind: "circleopen" }],
   });
   assert.equal((q.operations[0] as { kind: string }).kind, "circleopen");
+
+  // …and so do T17's newly unlocked ones (first/middle/last + the quirk
+  // suspects from the plan: hlslice, the radial/distance family)
+  for (const kind of ["circlecrop", "distance", "smoothup", "pixelize", "hlslice", "revealdown"]) {
+    const r = EditPlan.parse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind }] });
+    assert.equal((r.operations[0] as { kind: string }).kind, kind, kind);
+  }
 });
 
 test("crossfade duration must be positive (and sane-max bounded)", () => {
@@ -64,16 +86,22 @@ test("crossfade duration must be positive (and sane-max bounded)", () => {
   );
 });
 
-test("crossfade kind outside the frozen allowlist rejected", () => {
-  // real xfade transitions NOT in the frozen v1 set are rejected too — the
-  // allowlist is the contract, not the build's full 58-entry enum
-  assert.equal(
-    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "circlecrop" }] }).success,
-    false,
-  );
+test("crossfade kind outside the verified allowlist rejected; `custom` parses (fenced at validate)", () => {
+  // not a catalog kind at all — the allowlist remains the contract
   assert.equal(
     EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "zoom" }] }).success,
     false,
+  );
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "fader" }] }).success,
+    false,
+  );
+  // `custom` IS parseable — the xfade expr= sentinel routes to validate's
+  // OPERATION_INVALID fence (tested in ops-integration) instead of a generic
+  // enum rejection
+  assert.equal(
+    EditPlan.safeParse({ ...base, operations: [{ type: "crossfade", duration: 0.5, kind: "custom" }] }).success,
+    true,
   );
 });
 

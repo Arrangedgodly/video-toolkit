@@ -157,6 +157,19 @@ export async function validatePlan(
           });
         }
       }
+      if (op.type === "crossfade" && op.kind === "custom") {
+        // T17 fence: `custom` is the xfade enum sentinel (value −1) — it
+        // names an expr-driven transition and is not usable standalone; the
+        // schema parses it ONLY so this fence can say why (an actionable
+        // error beats a 59-value enum dump)
+        errors.push({
+          code: "OPERATION_INVALID",
+          operation: i + 1,
+          message:
+            "crossfade: kind 'custom' is the xfade expr= sentinel — it is not a standalone transition " +
+            "(the plan op does not expose expr=); pick a catalog kind via `video transitions`",
+        });
+      }
       if (op.type === "audio-mix") {
         try {
           await stat(op.file);

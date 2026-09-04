@@ -8,7 +8,8 @@ import { ToolError } from "../core/errors.js";
 import { CROSSFADE_KINDS } from "../core/schemas.js";
 import {
   parseXfadeTransitions,
-  assertSupersetOfFrozenKinds,
+  assertCatalogCoversAllowlist,
+  extrasBeyondAllowlist,
   catalogTransitions,
   transitionsCacheName,
 } from "../media/transitions.js";
@@ -34,12 +35,15 @@ test("parser: fixture → 58 kinds, help order kept, custom sentinel excluded", 
   assert.deepEqual(parseXfadeTransitions(XFADE_HELP_FIXTURE), FIXTURE_KINDS);
 });
 
-test("parser: the catalog is a SUPERSET of T12's frozen 15-name allowlist", () => {
-  const have = new Set(FIXTURE_KINDS);
-  for (const k of CROSSFADE_KINDS) {
-    assert.ok(have.has(k), `frozen crossfade kind missing from the catalog: ${k}`);
-  }
-  assert.ok(FIXTURE_KINDS.length >= CROSSFADE_KINDS.length);
+test("parser: the catalog EQUALS the schema allowlist (T17, both directions)", () => {
+  // deepEqual is bidirectional and order-sensitive: no allowlisted kind
+  // missing from the catalog, no catalog kind left out of the allowlist,
+  // help listing order pinned. (T12's superset law inverted by T17: the
+  // allowlist is now the FULL verified catalog.)
+  assert.deepEqual(FIXTURE_KINDS, [...CROSSFADE_KINDS]);
+  assert.equal(FIXTURE_KINDS.length, 58);
+  // the expr= sentinel is on neither side
+  assert.equal(CROSSFADE_KINDS.includes("custom" as (typeof CROSSFADE_KINDS)[number]), false);
 });
 
 test("parser: garbled or absent filter help → FILTER_HELP_UNPARSEABLE", () => {
@@ -78,30 +82,43 @@ test("parser: negative enum values are excluded as sentinels (pure rule)", () =>
   assert.deepEqual(parseXfadeTransitions(mini), ["fade", "wipeleft"]);
 });
 
-test("superset guard: a catalog missing a frozen kind fails loudly, naming it", () => {
+test("coverage guard: a catalog missing an allowlisted kind fails loudly, naming it", () => {
   assert.throws(
-    () => assertSupersetOfFrozenKinds(["fade", "wipeleft"], "9.0.1"),
+    () => assertCatalogCoversAllowlist(["fade", "wipeleft"], "9.0.1"),
     (e: unknown) =>
       e instanceof ToolError &&
       e.code === "FILTER_HELP_UNPARSEABLE" &&
       e.message.includes("circleopen") &&
-      e.message.includes("radial"),
+      e.message.includes("radial") &&
+      e.message.includes("allowlisted"),
   );
-  // and a genuine superset passes silently
-  assert.doesNotThrow(() => assertSupersetOfFrozenKinds(FIXTURE_KINDS, "9.0.1"));
+  // and the pinned build's full catalog passes silently
+  assert.doesNotThrow(() => assertCatalogCoversAllowlist(FIXTURE_KINDS, "9.0.1"));
+});
+
+test("extras rule: kinds beyond the allowlist are pure data, never a failure", () => {
+  // the pinned build lists nothing beyond the allowlist
+  assert.deepEqual(extrasBeyondAllowlist(FIXTURE_KINDS), []);
+  // an upgraded build's extras surface as data (the report note) — discovery
+  // must survive an ffmpeg upgrade
+  assert.deepEqual(extrasBeyondAllowlist([...FIXTURE_KINDS, "newhotness", "custom"]), [
+    "newhotness",
+    "custom",
+  ]);
 });
 
 // ---- live integration (this suite already requires ffmpeg on PATH) ----
 
-test("live: catalogTransitions shape, superset, no sentinel (no-cache)", async () => {
+test("live: catalogTransitions shape, coverage, no sentinel, no drift note (no-cache)", async () => {
   const report = await catalogTransitions({ noCache: true });
   assert.ok(Array.isArray(report.transitions) && report.transitions.length > 0);
   assert.equal(report.count, report.transitions.length);
   assert.match(report.ffmpeg, /\S+/);
   const kinds = report.transitions.map((t) => t.kind);
   assert.ok(!kinds.includes("custom"));
-  const have = new Set(kinds);
-  for (const k of CROSSFADE_KINDS) assert.ok(have.has(k), `live catalog missing ${k}`);
+  // this build lists nothing beyond the allowlist → no drift note
+  assert.equal(report.note, undefined);
+  assert.doesNotThrow(() => assertCatalogCoversAllowlist(kinds, report.ffmpeg));
 });
 
 test("live: this build still parses to the committed fixture's catalog", async () => {
@@ -111,6 +128,18 @@ test("live: this build still parses to the committed fixture's catalog", async (
     FIXTURE_KINDS,
     "this ffmpeg build's xfade enum changed vs src/test/xfade-help-fixture.ts — re-capture the fixture",
   );
+});
+
+test("live: the live catalog EQUALS the schema allowlist (T17 cross-check b)", async () => {
+  const report = await catalogTransitions({ noCache: true });
+  // deepEqual = equality in BOTH directions against the live build, not the
+  // fixture: allowlist == catalog on the pinned build, no re-derivation drift
+  assert.deepEqual(
+    report.transitions.map((t) => t.kind),
+    [...CROSSFADE_KINDS],
+    "the live xfade enum drifted from CROSSFADE_KINDS — an upgrade needs the T17 re-verification sweep and a re-derived allowlist",
+  );
+  assert.equal(report.count, CROSSFADE_KINDS.length);
 });
 
 test("live: cache keyed by ffmpeg version — written, hit, and guarded", async () => {
@@ -168,8 +197,12 @@ test("CLI: transitions emits compact single-line JSON with the catalog", async (
   assert.equal(r.stdout.trim().split("\n").length, 1, "compact output is one line");
   const data = JSON.parse(r.stdout) as { transitions: { kind: string }[]; count: number; ffmpeg: string };
   assert.equal(data.count, data.transitions.length);
-  const kinds = new Set(data.transitions.map((t) => t.kind));
-  for (const k of CROSSFADE_KINDS) assert.ok(kinds.has(k), `CLI catalog missing ${k}`);
+  // the CLI catalog IS the allowlist on this build (smoke per the T17 plan)
+  assert.equal(data.count, CROSSFADE_KINDS.length);
+  assert.deepEqual(
+    data.transitions.map((t) => t.kind),
+    [...CROSSFADE_KINDS],
+  );
 });
 
 test("CLI: transitions --pretty pretty-prints the same catalog", async () => {
