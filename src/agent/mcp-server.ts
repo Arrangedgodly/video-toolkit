@@ -25,10 +25,46 @@ import { readFile } from "node:fs/promises";
 import { ToolError } from "../core/errors.js";
 
 /**
- * MCP stdio adapter (JSON-RPC, newline-delimited). Thin: every tool call
- * dispatches to the same engine functions the CLI uses — no logic here.
- * Enables MCP clients (ZCode, Claude, etc.) without touching the engine.
+ * MCP server core + stdio adapter (JSON-RPC, newline-delimited). Thin: every
+ * tool call dispatches to the same engine functions the CLI uses — no logic
+ * here. `handleMessage` is the transport-neutral JSON-RPC dispatcher shared by
+ * the stdio transport (`startStdioServer`) and the streamable-HTTP transport
+ * (`src/agent/mcp-http.ts`); protocol semantics are identical on every
+ * transport. Enables MCP clients (ZCode, Claude, etc.) without touching the
+ * engine.
  */
+
+/** Protocol revisions this server speaks (initialize-era; see
+ * docs/ultron/research/r4-mcp-streamable-http.md). */
+export const KNOWN_PROTOCOL_VERSIONS: ReadonlySet<string> = new Set([
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]);
+
+/** One incoming JSON-RPC message (request or notification). */
+export interface McpMessage {
+  id?: unknown;
+  method?: string;
+  params?: Record<string, unknown>;
+}
+
+/** One outgoing JSON-RPC response (key order is load-bearing: stdio writes
+ * these verbatim as single lines and tests lock the exact bytes). */
+export interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: unknown;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
+
+export interface DispatchOptions {
+  /** Streamable-HTTP policy: echo the client's protocolVersion when known,
+   * else answer 2025-06-18 (the revision the server targets). Stdio keeps
+   * its historical behavior: echo whatever was sent, else 2024-11-05. */
+  negotiateProtocolVersion?: boolean;
+}
 
 interface ToolDef {
   name: string;
@@ -379,63 +415,80 @@ async function callTool(name: string, a: Record<string, unknown>): Promise<unkno
   }
 }
 
+/** Transport-neutral JSON-RPC dispatcher. Returns the response object for a
+ * request, or null when the message is a notification (no response). Wrappers
+ * frame the result: stdio writes it as one JSON line, HTTP answers 200 JSON /
+ * 202 empty. Behavior is byte-identical to the pre-HTTP stdio server. */
+export async function handleMessage(
+  msg: McpMessage,
+  opts: DispatchOptions = {},
+): Promise<JsonRpcResponse | null> {
+  const respond = (id: unknown, result: unknown): JsonRpcResponse => ({ jsonrpc: "2.0", id, result });
+  const respondError = (id: unknown, code: number, message: string): JsonRpcResponse => ({
+    jsonrpc: "2.0",
+    id,
+    error: { code, message },
+  });
+
+  const { id, method, params } = msg;
+  switch (method) {
+    case "initialize": {
+      const requested = params?.protocolVersion;
+      const protocolVersion = opts.negotiateProtocolVersion
+        ? typeof requested === "string" && KNOWN_PROTOCOL_VERSIONS.has(requested)
+          ? requested
+          : "2025-06-18"
+        : ((requested as string | undefined) ?? "2024-11-05");
+      return respond(id, {
+        protocolVersion,
+        capabilities: { tools: {} },
+        serverInfo: { name: "video-toolkit", version: "0.1.0" },
+      });
+    }
+    case "notifications/initialized":
+    case "initialized":
+      return null; // notification — no response
+    case "ping":
+      return respond(id, {});
+    case "tools/list":
+      return respond(id, { tools: TOOLS });
+    case "tools/call": {
+      const name = String(params?.name ?? "");
+      const args = (params?.arguments as Record<string, unknown>) ?? {};
+      try {
+        const result = await callTool(name, args);
+        return respond(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
+      } catch (e) {
+        const payload =
+          e instanceof ToolError
+            ? { error: e.toJSON() }
+            : { error: { code: "INTERNAL", message: e instanceof Error ? e.message : String(e) } };
+        return respond(id, {
+          content: [{ type: "text", text: JSON.stringify(payload) }],
+          isError: true,
+        });
+      }
+    }
+    default:
+      return id !== undefined ? respondError(id, -32601, `method not found: ${method}`) : null;
+  }
+}
+
 export function startStdioServer(): void {
   const write = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + "\n");
-  const respond = (id: unknown, result: unknown) => write({ jsonrpc: "2.0", id, result });
-  const respondError = (id: unknown, code: number, message: string) =>
-    write({ jsonrpc: "2.0", id, error: { code, message } });
-
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let msg: { id?: unknown; method?: string; params?: Record<string, unknown> };
+    let msg: McpMessage;
     try {
-      msg = JSON.parse(trimmed);
+      msg = JSON.parse(trimmed) as McpMessage;
     } catch {
       return;
     }
-    const { id, method, params } = msg;
-    void (async () => {
-      switch (method) {
-        case "initialize":
-          respond(id, {
-            protocolVersion: (params?.protocolVersion as string) ?? "2024-11-05",
-            capabilities: { tools: {} },
-            serverInfo: { name: "video-toolkit", version: "0.1.0" },
-          });
-          break;
-        case "notifications/initialized":
-        case "initialized":
-          break; // notification — no response
-        case "ping":
-          respond(id, {});
-          break;
-        case "tools/list":
-          respond(id, { tools: TOOLS });
-          break;
-        case "tools/call": {
-          const name = String(params?.name ?? "");
-          const args = (params?.arguments as Record<string, unknown>) ?? {};
-          try {
-            const result = await callTool(name, args);
-            respond(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
-          } catch (e) {
-            const payload =
-              e instanceof ToolError
-                ? { error: e.toJSON() }
-                : { error: { code: "INTERNAL", message: e instanceof Error ? e.message : String(e) } };
-            respond(id, {
-              content: [{ type: "text", text: JSON.stringify(payload) }],
-              isError: true,
-            });
-          }
-          break;
-        }
-        default:
-          if (id !== undefined) respondError(id, -32601, `method not found: ${method}`);
-      }
-    })();
+    void handleMessage(msg).then((res) => {
+      if (res !== null) write(res);
+    });
   });
 }
 

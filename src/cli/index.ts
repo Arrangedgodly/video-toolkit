@@ -63,6 +63,10 @@ analysis (timestamped observations; never render):
 
 agent adapter:
   mcp                       MCP stdio server (JSON-RPC tools for MCP clients)
+  mcp-serve                 MCP streamable-HTTP server on /mcp (same tools;
+                             plain-JSON replies, no SSE) [--port 8765]
+                             [--host 127.0.0.1] [--token <bearer>] — token
+                             required when --host is not loopback
 
 plan operations: trim (keep range), cut (remove range), normalize-audio,
   speed (factor), resize (width[, height]), volume (db|factor),
@@ -117,6 +121,9 @@ interface CliFlags {
   keywords?: string;
   minScore?: number;
   plan?: string;
+  port?: number;
+  host?: string;
+  token?: string;
 }
 
 function parseArgs(argv: string[]): CliFlags {
@@ -165,6 +172,9 @@ function parseArgs(argv: string[]): CliFlags {
     else if (a === "--keywords") f.keywords = argv[++i];
     else if (a === "--min-score") f.minScore = Number(argv[++i]);
     else if (a === "--plan") f.plan = argv[++i];
+    else if (a === "--port") f.port = Number(argv[++i]);
+    else if (a === "--host") f.host = argv[++i];
+    else if (a === "--token") f.token = argv[++i];
     else if (a === "-h" || a === "--help") f.help = true;
     else f.positional.push(a);
   }
@@ -453,6 +463,27 @@ async function main(): Promise<void> {
       const { startStdioServer } = await import("../agent/mcp-server.js");
       startStdioServer();
       return;
+    }
+    case "mcp-serve": {
+      const { startHttpServer, isLoopbackHost } = await import("../agent/mcp-http.js");
+      const host = f.host ?? "127.0.0.1";
+      const port = f.port ?? 8765;
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        throw new ToolError(
+          "OPERATION_INVALID",
+          `--port must be an integer in 0..65535 (0 = OS-assigned free port), got ${f.port}`,
+        );
+      }
+      // Off-loopback bind without a token = any local process can drive ffmpeg
+      // over arbitrary files (and write outputs) — refuse, recommend a token.
+      if (!isLoopbackHost(host) && !f.token) {
+        throw new ToolError(
+          "OPERATION_INVALID",
+          `mcp-serve refuses to bind non-loopback --host ${host} without --token: the endpoint runs ffmpeg on arbitrary local paths; pass --token <bearer> and give clients Authorization: Bearer <token>`,
+        );
+      }
+      startHttpServer({ port, host, token: f.token });
+      return; // the listening server keeps the process alive
     }
     case "benchmark": {
       if (!input) throw new ToolError("SOURCE_NOT_FOUND", "usage: video benchmark <input>");

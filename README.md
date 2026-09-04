@@ -135,13 +135,14 @@ The full code list (`SOURCE_NOT_FOUND`, `MIX_INPUT_NOT_FOUND`, `OBSERVATION_INVA
 
 ## MCP server
 
-The same engine is exposed as an MCP stdio server — a thin adapter over the engine functions the CLI uses (the engine has no knowledge of MCP or any AI provider):
+The same engine is exposed as an MCP server — a thin adapter over the engine functions the CLI uses (the engine has no knowledge of MCP or any AI provider) — over stdio or streamable HTTP:
 
 ```sh
-video mcp        # or: video-mcp
+video mcp          # stdio (or: video-mcp)
+video mcp-serve    # streamable HTTP on http://127.0.0.1:8765/mcp
 ```
 
-Every CLI command becomes a `video_<command>` tool (`video_inspect`, `video_render`, `video_detect_silence`, `video_review_frames`, …). Client config (ZCode/Claude-style):
+Every CLI command becomes a `video_<command>` tool (`video_inspect`, `video_render`, `video_detect_silence`, `video_review_frames`, …). Stdio client config (ZCode/Claude-style):
 
 ```json
 {
@@ -153,11 +154,31 @@ Every CLI command becomes a `video_<command>` tool (`video_inspect`, `video_rend
 
 Tool results are the same compact JSON the CLI emits; failures arrive as `isError` results carrying the same `{error: {code, message}}` objects, so error branching is identical across CLI and MCP.
 
+### Streamable HTTP
+
+`video mcp-serve [--port 8765] [--host 127.0.0.1] [--token <bearer>]` serves the same tools over MCP streamable HTTP: a single `/mcp` endpoint with plain-JSON replies (no SSE), optional sessions (a `Mcp-Session-Id` is issued at `initialize`; `DELETE` ends one), and transport failures as HTTP statuses — `405` on GET, `401` for a bad bearer token, `403` for a foreign `Origin`, `400` for bad JSON or an unsupported protocol-version header. `--token` is mandatory when `--host` is anything but loopback: the endpoint can run ffmpeg over arbitrary local files. HTTP client config:
+
+```json
+{
+  "mcpServers": {
+    "video": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "timeoutMs": 600000
+    }
+  }
+}
+```
+
+Long renders need a generous client timeout — without SSE there is no progress push (the same blackout as stdio).
+
 ## Architecture
 
 ```
 CLI (src/cli)                    thin dispatch, compact JSON out
-agent/ (src/agent)               MCP stdio adapter — same engine functions
+agent/ (src/agent)               MCP adapters — stdio + streamable HTTP,
+                                 same engine functions, shared dispatcher
   ↓
 core/schemas                     Zod: edit plan + observation schemas
 core/timeline                    ops → keep-segments (pure math, fully tested)
