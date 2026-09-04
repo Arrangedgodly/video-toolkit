@@ -275,6 +275,68 @@ test("zoom mode/easing enums enforced; factor stays raw for validate's fence", (
   }
 });
 
+// ---- image-overlay (T21; ONE image burned over the composed output in the
+// same pass — png-with-alpha contract, overlay-text visibility-window
+// semantics, opacity deliberately RAW like zoom.factor so validate fences it)
+
+test("image-overlay parses minimal and full forms", () => {
+  const minimal = EditPlan.parse({ ...base, operations: [{ type: "image-overlay", file: "logo.png" }] });
+  assert.equal(minimal.operations[0]?.type, "image-overlay");
+
+  const full = EditPlan.parse({
+    ...base,
+    operations: [{
+      type: "image-overlay",
+      file: "wm.png",
+      position: "top-left",
+      width: 320,
+      opacity: 0.8,
+      from: 0.5,
+      to: 4,
+    }],
+  });
+  assert.equal(full.operations.length, 1);
+});
+
+test("image-overlay bounds enforced: file, position enum, integer width, window ≥ 0; opacity stays raw for validate's fence", () => {
+  const bad: unknown[] = [
+    { type: "image-overlay" }, // file is required
+    { type: "image-overlay", file: "" },
+    { type: "image-overlay", file: "x.png", position: "middle" },
+    { type: "image-overlay", file: "x.png", position: "bottom" }, // overlay-text position, not this op's enum
+    { type: "image-overlay", file: "x.png", width: 0 },
+    { type: "image-overlay", file: "x.png", width: 16385 },
+    { type: "image-overlay", file: "x.png", width: 480.5 }, // non-integer
+    { type: "image-overlay", file: "x.png", from: -1 },
+    { type: "image-overlay", file: "x.png", to: -0.5 },
+  ];
+  for (const op of bad) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [op] }).success,
+      false,
+      `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+  // the opacity RANGE is deliberately NOT schema-bounded (the zoom.factor
+  // pattern): 0 / negative / >1 parse so validate can reject them with its
+  // own OPERATION_INVALID naming the range (tested in ops-integration)
+  for (const opacity of [0, -0.5, 1.5, 7]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [{ type: "image-overlay", file: "x.png", opacity }] }).success,
+      true,
+      `opacity ${opacity} must parse (validate fences the range)`,
+    );
+  }
+  // boundary widths accepted (the resize/export-gif mirror: int 1..16384)
+  for (const width of [1, 16384]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [{ type: "image-overlay", file: "x.png", width }] }).success,
+      true,
+      `width ${width} must parse`,
+    );
+  }
+});
+
 // ---- export-gif (T19; terminal export op — first of the export-op class,
 // NOT a TransformOpType member: it changes the output FORMAT, not content)
 

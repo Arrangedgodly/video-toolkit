@@ -6,9 +6,11 @@ import {
   buildRenderCommand,
   escapeDrawText,
   escapeFilterPath,
+  overlayPositionExpressions,
   zoomExpressions,
   zoomPanFilter,
   zoomRampFrames,
+  type ImageOverlayOptions,
   type MixOptions,
   type ZoomOptions,
 } from "../media/ffmpeg.js";
@@ -775,4 +777,266 @@ test("builder: plans WITHOUT the zoom op produce byte-identical commands (the ve
   );
   assert.ok(!chain.join(" ").includes("zoompan"));
   assert.ok(!chain.join(" ").includes("scale=2560:1440"));
+});
+
+// ---- image-overlay (T21; ONE overlay filter fed by an ADDITIONAL input —
+// the audio-mix second-input precedent — composing at the drawtext point on
+// all three paths; margin 16 px / scale -1 / uniform aa chain are the
+// recorded in-task decisions, measured against this ffmpeg build)
+
+const img: ImageOverlayOptions = {
+  file: "logo.png",
+  position: "bottom-right",
+  opacity: 1,
+};
+
+test("overlayPositionExpressions: all five positions (fixed 16 px margin, W/H main, w/h overlay)", () => {
+  assert.deepEqual(overlayPositionExpressions("top-left"), { x: "16", y: "16" });
+  assert.deepEqual(overlayPositionExpressions("top-right"), { x: "W-w-16", y: "16" });
+  assert.deepEqual(overlayPositionExpressions("bottom-left"), { x: "16", y: "H-h-16" });
+  assert.deepEqual(overlayPositionExpressions("bottom-right"), { x: "W-w-16", y: "H-h-16" });
+  assert.deepEqual(overlayPositionExpressions("center"), { x: "(W-w)/2", y: "(H-h)/2" });
+});
+
+test("builder: image-overlay flips the select path into -filter_complex (image = input 1, audio keeps -af)", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", { ...opts, imageOverlay: img }, true);
+  assert.deepEqual(argv, [
+    "-nostdin", "-hide_banner", "-y",
+    "-i", "in.mp4",
+    "-i", "logo.png",
+    "-filter_complex",
+    "[0:v]select='between(t,0.000,10.000)',setpts=N/FRAME_RATE/TB[vb];" +
+      "[1:v]format=rgba,colorchannelmixer=aa=1[im];" +
+      "[vb][im]overlay=x=W-w-16:y=H-h-16,format=yuv420p[v]",
+    "-map", "[v]",
+    "-map", "0:a",
+    "-af", "aselect='between(t,0.000,10.000)',asetpts=N/SR/TB",
+    "-c:a", "aac", "-b:a", "192k",
+    "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+    "-movflags", "+faststart", "out.mp4",
+  ]);
+  // -vf cannot reference a second input — the graph is the ONLY video path
+  assert.equal(argv.includes("-vf"), false);
+  assert.equal(argv.filter((a) => a === "-i").length, 2);
+  assert.equal(argv.filter((a) => a === "-filter_complex").length, 1);
+});
+
+test("builder: image-overlay on an audio-less source maps [v] and -an", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", { ...opts, imageOverlay: img }, false);
+  assert.equal(argv.includes("-af"), false);
+  assert.ok(argv.includes("-an"));
+  const mapIdx = argv.indexOf("-map");
+  assert.deepEqual(argv.slice(mapIdx, mapIdx + 2), ["-map", "[v]"]);
+});
+
+test("builder: image-overlay width scale (-1 exact aspect), opacity keel, window math incl. omitted bounds", () => {
+  const full = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts,
+    imageOverlay: { ...img, width: 120, opacity: 0.35, from: 0.5, to: 2 },
+  }, true);
+  const g = (argv: string[]) => argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.ok(g(full).includes("[1:v]scale=120:-1,format=rgba,colorchannelmixer=aa=0.35[im]"), g(full));
+  assert.ok(g(full).includes("overlay=x=W-w-16:y=H-h-16:enable='between(t,0.500,2.000)'"), g(full));
+
+  // from-only / to-only / neither — drawtext's window semantics verbatim
+  const fromOnly = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, imageOverlay: { ...img, from: 1 },
+  }, true);
+  const toOnly = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, imageOverlay: { ...img, to: 3.4567 },
+  }, true);
+  assert.ok(g(fromOnly).includes("enable='gte(t,1.000)'"), g(fromOnly));
+  assert.ok(g(toOnly).includes("enable='lte(t,3.457)'"), g(toOnly));
+  assert.ok(!g(buildRenderCommand("in.mp4", segs, "out.mp4", { ...opts, imageOverlay: img }, true)).includes("enable="));
+});
+
+test("builder: every image-overlay position reaches the graph (x/y verbatim from the table)", () => {
+  for (const position of ["top-left", "top-right", "bottom-left", "bottom-right", "center"] as const) {
+    const argv = buildRenderCommand("in.mp4", segs, "out.mp4", {
+      ...opts, imageOverlay: { ...img, position },
+    }, true);
+    const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+    const { x, y } = overlayPositionExpressions(position);
+    assert.ok(graph.includes(`overlay=x=${x}:y=${y}`), `${position}: ${graph}`);
+  }
+});
+
+test("builder: image-overlay composes at the drawtext point — after zoom/scale/subtitles, before the encoder format", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts,
+    speedFactor: 1.25,
+    scaleWidth: 640,
+    subtitleFile: "subs.srt",
+    overlayText: { text: "Title", position: "bottom", fontsize: 48, color: "white", box: true },
+    zoom: zx("in", "smooth", 1.3),
+    imageOverlay: img,
+  }, true);
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  const order = [
+    "select=",
+    "zoompan=",
+    "setpts=N/FRAME_RATE/TB/1.25",
+    "scale=640:-2",
+    "subtitles=",
+    "drawtext=",
+    "overlay=x=W-w-16:y=H-h-16",
+    "format=yuv420p",
+  ];
+  let prev = -1;
+  for (const part of order) {
+    const at = graph.indexOf(part);
+    assert.ok(at !== -1, `${part} missing: ${graph}`);
+    assert.ok(at > prev, `${part} must come after the previous stage: ${graph}`);
+    prev = at;
+  }
+  // the overlay does NOT zoom with the content (anchors on the OUTPUT frame):
+  // the overlay link consumes [vb] AFTER zoompan/setpts, never [0:v] raw
+  assert.ok(graph.includes("[vb][im]overlay="), graph);
+});
+
+test("builder: image-overlay rides the transition chain after the last xfade tail (image = input n)", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, imageOverlay: img, crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  assert.equal(
+    argv[argv.indexOf("-filter_complex") + 1],
+    "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=2.500[vc];" +
+      "[2:v]format=rgba,colorchannelmixer=aa=1[im];" +
+      "[vc][im]overlay=x=W-w-16:y=H-h-16,format=yuv420p[v];" +
+      "[0:a][1:a]acrossfade=d=0.500[a]",
+  );
+  // ONE invocation: 2 source inputs + the image, all in one -filter_complex
+  assert.deepEqual(
+    argv.filter((_, i) => argv[i - 1] === "-i"),
+    ["in.mp4", "in.mp4", "logo.png"],
+  );
+  assert.equal(argv.filter((a) => a === "-filter_complex").length, 1);
+});
+
+test("builder: chain + image-overlay + speed/subtitles/drawtext keeps the tail order, overlay last", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    {
+      ...opts,
+      speedFactor: 2,
+      subtitleFile: "subs.srt",
+      overlayText: { text: "T", position: "bottom", fontsize: 48, color: "white", box: false },
+      imageOverlay: img,
+      crossfade: { duration: 0.5, kind: "wipeleft" },
+    },
+    true,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  const order = ["xfade=transition=wipeleft", "setpts=PTS/2", "subtitles=", "drawtext=", "overlay=x=W-w-16", "format=yuv420p"];
+  let prev = -1;
+  for (const part of order) {
+    const at = graph.indexOf(part);
+    assert.ok(at !== -1, `${part} missing: ${graph}`);
+    assert.ok(at > prev, `${part} must come after the previous stage: ${graph}`);
+    prev = at;
+  }
+});
+
+test("builder: image-overlay composes before the gif palette suffix (select path, no yuv420p)", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, imageOverlay: img, gif: { width: 480, fps: 12 },
+  }, true);
+  assert.deepEqual(argv, [
+    "-nostdin", "-hide_banner", "-y",
+    "-i", "in.mp4",
+    "-i", "logo.png",
+    "-filter_complex",
+    "[0:v]select='between(t,0.000,10.000)',setpts=N/FRAME_RATE/TB[vb];" +
+      "[1:v]format=rgba,colorchannelmixer=aa=1[im];" +
+      "[vb][im]overlay=x=W-w-16:y=H-h-16," +
+      "fps=12,scale=480:-2:flags=lanczos,split[a][b];" +
+      "[a]palettegen=stats_mode=diff[p];" +
+      "[b][p]paletteuse=dither=bayer:bayer_scale=5[v]",
+    "-map", "[v]",
+    "-an",
+    "out.gif",
+  ]);
+  assert.equal(argv.includes("-c:v"), false);
+});
+
+test("builder: chain + image-overlay hands off to the palette graph at [vx] (window trim stays downstream)", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.gif",
+    {
+      ...opts,
+      imageOverlay: img,
+      crossfade: { duration: 0.5, kind: "fade" },
+      gif: { width: 480, fps: 12, from: 0.5, to: 2 },
+    },
+    true,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.equal(
+    graph,
+    "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=2.500[vc];" +
+      "[2:v]format=rgba,colorchannelmixer=aa=1[im];" +
+      "[vc][im]overlay=x=W-w-16:y=H-h-16[vx];" +
+      "[vx]trim=start=0.500:end=2.000,setpts=PTS-STARTPTS," +
+      "fps=12,scale=480:-2:flags=lanczos,split[a][b];" +
+      "[a]palettegen=stats_mode=diff[p];" +
+      "[b][p]paletteuse=dither=bayer:bayer_scale=5[v]",
+    graph,
+  );
+  // the enable window addresses the FULL output timeline (overlay BEFORE the
+  // gif window trim) — consistent with the mp4 paths
+  assert.ok(graph.indexOf("overlay=") < graph.indexOf("trim="), graph);
+});
+
+test("builder: image-overlay + audio-mix share ONE -filter_complex (image is the LAST input, after the bed)", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.mp4", {
+    ...opts, mix, imageOverlay: img,
+  }, true);
+  assert.deepEqual(
+    argv.filter((_, i) => argv[i - 1] === "-i"),
+    ["in.mp4", "bed.mp3", "logo.png"],
+    argv.join(" "),
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  // image input 2 (source 0, bed 1); the validated mix graph rides VERBATIM
+  assert.ok(graph.includes("[2:v]format=rgba,colorchannelmixer=aa=1[im]"), graph);
+  assert.ok(graph.includes("[main][ducked]amix=inputs=2:duration=first:normalize=0[a]"), graph);
+  assert.deepEqual(
+    argv.slice(argv.indexOf("-map"), argv.indexOf("-map") + 4),
+    ["-map", "[v]", "-map", "[a]"],
+  );
+  assert.equal(argv.includes("-vf"), false);
+  assert.equal(argv.includes("-af"), false);
+  assert.equal(argv.filter((a) => a === "-filter_complex").length, 1);
+});
+
+test("builder: plans WITHOUT the image op produce byte-identical commands (overlay canary)", () => {
+  // the locks above pin the exact graphs; this canary guards the flip itself
+  const select = buildRenderCommand("in.mp4", segs, "out.mp4", opts, true);
+  assert.ok(!select.join(" ").includes("overlay="));
+  assert.ok(!select.join(" ").includes("[im]"));
+  assert.equal(select.filter((a) => a === "-i").length, 1);
+  assert.notEqual(select.indexOf("-vf"), -1);
+  const chain = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  assert.ok(!chain.join(" ").includes("overlay="));
+  assert.ok(!chain.join(" ").includes("[vc]"));
+  assert.equal(chain.filter((a) => a === "-i").length, 2);
+  const gifv = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, gif: { width: 480, fps: 12 },
+  }, true);
+  assert.ok(!gifv.join(" ").includes("overlay="));
+  assert.equal(gifv.filter((a) => a === "-i").length, 1);
 });

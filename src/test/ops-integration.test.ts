@@ -21,6 +21,9 @@ const XFK = "xfk.mp4"; // 2.6s, 320x180@25: red[0,1.3)+440Hz, green[1.3,2.6)+880
 const BARX = "barx.mp4"; // 10s, 640x360@30: black + full-height WHITE 24px bar at
 //                        x=308..331 (center 320) + 440Hz tone — R5's bar-marker
 //                        fixture shape (the zoom/pan visual-evidence probe)
+const WM = "wm.png"; // 120x80 solid-RED rgba png — T21's watermark marker (a
+//                     red rectangle on transparent; the region probe below
+//                     detects it as pure red over the solid-black fixture)
 let dir = "";
 
 before(async () => {
@@ -116,6 +119,15 @@ before(async () => {
     "-c:a", "aac", "-b:a", "128k", BARX,
   ]);
   assert.equal(r8.code, 0, r8.stderr);
+
+  // T21's watermark: solid red on transparent, 120x80 — the region-probe
+  // marker (pixel evidence below: exact placement at all five positions)
+  const r9 = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=c=red:s=120x80,format=rgba",
+    "-frames:v", "1", WM,
+  ]);
+  assert.equal(r9.code, 0, r9.stderr);
 });
 
 after(async () => {
@@ -1289,6 +1301,286 @@ test("zoom validation: factor range, duplicates, sub-2-frame ramp units; render 
   );
   await assert.rejects(
     () => renderPlan("ze-tiny.json"),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+});
+
+// ---- image-overlay (T21; ONE image burned over the composed output via an
+// ADDITIONAL input — pixel-verified placement on solid-black fixtures: the
+// 120x80 red marker must appear at exactly one of the five spots (640x360,
+// margin 16) and NOWHERE else, on the select path, the crossfade chain, and
+// the gif path — each a SINGLE invocation)
+
+/** mean RGB of a rectangular region in one decoded frame — the placement
+ * probe (red marker ≈ {252,0,0} over solid black {0,0,0}; inner insets dodge
+ * the encoder's 4:2:0 edge blur). */
+async function regionMean(
+  file: string,
+  t: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): Promise<{ r: number; g: number; b: number }> {
+  const r = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-ss", String(t), "-i", file,
+    "-frames:v", "1", "-vf", `crop=${w}:${h}:${x}:${y}`, "-pix_fmt", "rgb24",
+    "-f", "rawvideo", "t21-region.raw",
+  ]);
+  assert.equal(r.code, 0, r.stderr);
+  const buf = await readFile("t21-region.raw");
+  assert.equal(buf.length, w * h * 3, `region ${w}x${h} decode`);
+  let rr = 0, gg = 0, bb = 0;
+  for (let i = 0; i < buf.length; i += 3) {
+    rr += buf[i]!;
+    gg += buf[i + 1]!;
+    bb += buf[i + 2]!;
+  }
+  const n = w * h;
+  return { r: rr / n, g: gg / n, b: bb / n };
+}
+
+/** the five placement spots for a 120x80 marker on 640x360 at margin 16. */
+const OVERLAY_SPOTS = {
+  "top-left": { x: 16, y: 16 },
+  "top-right": { x: 504, y: 16 },
+  "bottom-left": { x: 16, y: 264 },
+  "bottom-right": { x: 504, y: 264 },
+  center: { x: 260, y: 140 },
+} as const;
+type OverlaySpot = keyof typeof OVERLAY_SPOTS;
+
+function wmPlan(ops: unknown[], output: string): unknown {
+  return { version: 1, source: BLACK, operations: ops, output: { path: output } };
+}
+
+test("image-overlay: all five positions pixel-verified on the select path; ONE invocation each", async () => {
+  for (const position of Object.keys(OVERLAY_SPOTS) as OverlaySpot[]) {
+    const p = await writePlan(`io-${position}.json`, wmPlan([
+      { type: "trim", start: 0, end: 2 },
+      { type: "image-overlay", file: WM, position },
+    ], `io-${position}.mp4`));
+    const v = await validatePlan(p);
+    assert.equal(v.valid, true, `${position}: ${JSON.stringify(v.errors)}`);
+    const r = await renderPlan(p);
+    // INVARIANT 1: exactly ONE invocation, two inputs (source + image), the
+    // video graph flipped into -filter_complex (a -vf chain cannot do this)
+    assert.equal(r.command[0], "ffmpeg");
+    assert.equal(r.command.filter((a) => a === "-i").length, 2, position);
+    assert.deepEqual(r.command.filter((_, i) => r.command[i - 1] === "-i"), [BLACK, WM]);
+    assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+    assert.equal(r.command.includes("-vf"), false);
+    const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+    assert.ok(graph.includes("[vb][im]overlay=x="), `${position}: ${graph}`);
+
+    // PIXEL EVIDENCE: exactly the target spot carries the marker at t=1.0 —
+    // every other spot is untouched solid black
+    for (const spot of Object.keys(OVERLAY_SPOTS) as OverlaySpot[]) {
+      const s = OVERLAY_SPOTS[spot];
+      const m = await regionMean(r.output, 1.0, s.x + 10, s.y + 10, 100, 60);
+      if (spot === position) {
+        assert.ok(
+          m.r > 180 && m.g < 60 && m.b < 60,
+          `${position}: marker expected at ${spot}: ${JSON.stringify(m)}`,
+        );
+      } else {
+        assert.ok(
+          m.r < 12 && m.g < 12 && m.b < 12,
+          `${position}: ${spot} must stay solid black: ${JSON.stringify(m)}`,
+        );
+      }
+    }
+    // a burn, not a re-time: duration unchanged
+    assert.ok(Math.abs(r.outputDuration - 2) < 0.2, `${position}: duration ${r.outputDuration}`);
+  }
+});
+
+test("image-overlay: enable window — visible inside, absent on BOTH sides; preview parity", async () => {
+  const p = await writePlan("io-win.json", wmPlan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "image-overlay", file: WM, from: 0.5, to: 1.5 },
+  ], "io-win.mp4"));
+  const r = await renderPlan(p);
+  const cmd = r.command.join(" ");
+  assert.ok(cmd.includes("enable='between(t,0.500,1.500)'"), cmd);
+  const inside = await regionMean(r.output, 1.0, 514, 274, 100, 60);
+  const early = await regionMean(r.output, 0.2, 514, 274, 100, 60);
+  const late = await regionMean(r.output, 1.9, 514, 274, 100, 60);
+  assert.ok(inside.r > 180, `visible inside the window: ${JSON.stringify(inside)}`);
+  assert.ok(early.r < 12, `invisible before the window: ${JSON.stringify(early)}`);
+  assert.ok(late.r < 12, `invisible after the window: ${JSON.stringify(late)}`);
+
+  const pv = await renderPlan(p, { mode: "preview", force: true });
+  assert.ok(pv.output.endsWith("io-win.preview.mp4"), pv.output);
+  assert.ok(pv.command.join(" ").includes("overlay=x="), "preview carries the same overlay");
+});
+
+test("image-overlay: opacity dims the marker (aa=0.5 halves the region exactly)", async () => {
+  const full = await renderPlan(await writePlan("io-op1.json", wmPlan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "image-overlay", file: WM },
+  ], "io-op1.mp4")));
+  const half = await renderPlan(await writePlan("io-op05.json", wmPlan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "image-overlay", file: WM, opacity: 0.5 },
+  ], "io-op05.mp4")));
+  assert.ok(half.command.join(" ").includes("colorchannelmixer=aa=0.5"));
+  const m1 = await regionMean(full.output, 1.0, 514, 274, 100, 60);
+  const m2 = await regionMean(half.output, 1.0, 514, 274, 100, 60);
+  assert.ok(m1.r > 180, `full-opacity marker: ${JSON.stringify(m1)}`);
+  const ratio = m2.r / m1.r;
+  assert.ok(
+    ratio > 0.4 && ratio < 0.6 && m2.g < 30 && m2.b < 30,
+    `aa=0.5 must halve the marker: ${m1.r} -> ${m2.r} (ratio ${ratio.toFixed(3)})`,
+  );
+});
+
+test("image-overlay: width scales the marker keeping aspect (60x40), nothing beyond it", async () => {
+  const r = await renderPlan(await writePlan("io-w60.json", wmPlan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "image-overlay", file: WM, position: "top-left", width: 60 },
+  ], "io-w60.mp4")));
+  const cmd = r.command.join(" ");
+  assert.ok(cmd.includes("scale=60:-1"), cmd); // exact aspect (-1), not -2
+  const inner = await regionMean(r.output, 1.0, 22, 22, 48, 28); // inside the 60x40 marker
+  const beyond = await regionMean(r.output, 1.0, 90, 22, 40, 28); // inside the NATIVE footprint, outside the scaled marker
+  assert.ok(inner.r > 180, `scaled marker present: ${JSON.stringify(inner)}`);
+  assert.ok(beyond.r < 12 && beyond.g < 12, `beyond the scaled width stays black: ${JSON.stringify(beyond)}`);
+});
+
+test("image-overlay: crossfade chain path — ONE invocation (2 source inputs + image), marker over the join", async () => {
+  // keeps [0,0.8]+[1.2,2.0] = 1.6s, fade 0.2 -> expected 1.4s
+  const p = await writePlan("io-chain.json", wmPlan([
+    { type: "trim", start: 0, end: 0.8 },
+    { type: "trim", start: 1.2, end: 2 },
+    { type: "crossfade", duration: 0.2 },
+    { type: "image-overlay", file: WM },
+  ], "io-chain.mp4"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  const r = await renderPlan(p);
+  assert.equal(r.command.filter((a) => a === "-i").length, 3, "2 source inputs + the image");
+  assert.deepEqual(r.command.filter((_, i) => r.command[i - 1] === "-i"), [BLACK, BLACK, WM]);
+  assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  assert.ok(graph.includes("[vc][im]overlay=x=W-w-16:y=H-h-16,format=yuv420p[v]"), graph);
+  assert.ok(Math.abs(r.outputDuration - 1.4) < 0.05, `duration ${r.outputDuration}`);
+
+  // marker present in pure segment 1, ON TOP of the fade window, absent elsewhere
+  const seg1 = await regionMean(r.output, 0.4, 514, 274, 100, 60);
+  const fade = await regionMean(r.output, 0.75, 514, 274, 100, 60);
+  const tl = await regionMean(r.output, 0.4, 26, 26, 100, 60);
+  assert.ok(seg1.r > 180, `marker in pure content: ${JSON.stringify(seg1)}`);
+  assert.ok(fade.r > 180, `marker over the fade join: ${JSON.stringify(fade)}`);
+  assert.ok(tl.r < 12 && tl.g < 12, `top-left untouched: ${JSON.stringify(tl)}`);
+});
+
+test("image-overlay: gif path — marker rides BEFORE the palette graph, ONE invocation, real gif", async () => {
+  const p = await writePlan("io-gif.json", wmPlan([
+    { type: "trim", start: 0, end: 2 },
+    { type: "image-overlay", file: WM, position: "top-left" },
+    { type: "export-gif", width: 480 },
+  ], "io-gif.gif"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  const r = await renderPlan(p);
+  assert.equal(r.encoder, "gif");
+  assert.equal(r.command.filter((a) => a === "-i").length, 2, "source + image, one invocation");
+  assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  assert.ok(graph.includes("[vb][im]overlay=x=16:y=16,"), graph);
+  assert.ok(graph.indexOf("overlay=") < graph.indexOf("fps=12"), graph); // before the palette suffix
+  assert.ok(graph.includes("palettegen=stats_mode=diff"), graph);
+  const info = await inspectFile(r.output);
+  assert.equal(info.video?.codec, "gif");
+  assert.equal(info.video?.width, 480);
+
+  // pixel evidence at 480x270: the marker scales to 90x60 at (12,12); the
+  // bottom-right spot (378,183) stays black (palette-quantized red still red)
+  const m = await regionMean(r.output, 1.0, 18, 18, 78, 48);
+  const br = await regionMean(r.output, 1.0, 384, 189, 78, 48);
+  assert.ok(m.r > 150 && m.g < 60, `marker in the gif: ${JSON.stringify(m)}`);
+  assert.ok(br.r < 20 && br.g < 20, `opposite corner stays black: ${JSON.stringify(br)}`);
+});
+
+test("image-overlay validation: missing file, opacity fence, window, output-duration bound (speed-aware), duplicates", async () => {
+  // missing image file -> OPERATION_INVALID carrying the path
+  const e1 = await validatePlan(await writePlan("ie1.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "image-overlay", file: "missing-wm.png" },
+  ])));
+  assert.equal(e1.valid, false);
+  assert.equal(e1.errors[0]?.code, "OPERATION_INVALID");
+  assert.equal(e1.errors[0]?.path, "missing-wm.png");
+  assert.equal(e1.errors[0]?.operation, 2);
+  await assert.rejects(
+    () => renderPlan("ie1.json"),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+
+  // opacity fence (0 / 1.5 parse at schema level; validate rejects, boundaries pass)
+  for (const opacity of [0, 1.5]) {
+    const r = await validatePlan(await writePlan(`ie-o${opacity}.json`, plan([
+      { type: "trim", start: 0, end: 12 },
+      { type: "image-overlay", file: WM, opacity },
+    ])));
+    assert.equal(r.valid, false, `opacity ${opacity} must be fenced`);
+    assert.equal(r.errors[0]?.code, "OPERATION_INVALID");
+    assert.ok(r.errors[0]?.message.includes("0 < o ≤ 1"), r.errors[0]?.message);
+  }
+  for (const opacity of [1, 0.001]) {
+    const r = await validatePlan(await writePlan(`ie-ok${opacity}.json`, plan([
+      { type: "trim", start: 0, end: 12 },
+      { type: "image-overlay", file: WM, opacity },
+    ])));
+    assert.equal(r.valid, true, `opacity ${opacity}: ${JSON.stringify(r.errors)}`);
+  }
+
+  // from >= to
+  const e2 = await validatePlan(await writePlan("ie2.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "image-overlay", file: WM, from: 3, to: 3 },
+  ])));
+  assert.equal(e2.valid, false);
+  assert.equal(e2.errors[0]?.code, "RANGE_NEGATIVE");
+  assert.equal(e2.errors[0]?.operation, 2);
+
+  // to beyond the timeline (fixture is 12s)
+  const e3 = await validatePlan(await writePlan("ie3.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "image-overlay", file: WM, to: 13 },
+  ])));
+  assert.equal(e3.valid, false);
+  assert.equal(e3.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(e3.errors[0]?.message.includes("exceeds expected output duration"), e3.errors[0]?.message);
+
+  // speed-aware bound: timeline 12 at 2x -> expected output 6s
+  const e4 = await validatePlan(await writePlan("ie4.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "image-overlay", file: WM, to: 6.5 },
+  ])));
+  assert.equal(e4.valid, false);
+  assert.equal(e4.errors[0]?.code, "OPERATION_INVALID");
+  const e5 = await validatePlan(await writePlan("ie5.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "speed", factor: 2 },
+    { type: "image-overlay", file: WM, to: 5.9 },
+  ])));
+  assert.equal(e5.valid, true, JSON.stringify(e5.errors));
+
+  // duplicate op joins the seenTransforms rule; render of it throws the code
+  const e6 = await validatePlan(await writePlan("ie6.json", plan([
+    { type: "trim", start: 0, end: 12 },
+    { type: "image-overlay", file: WM },
+    { type: "image-overlay", file: WM },
+  ])));
+  assert.equal(e6.valid, false);
+  assert.equal(e6.errors[0]?.code, "OPERATION_INVALID");
+  assert.equal(e6.errors[0]?.operation, 3);
+  await assert.rejects(
+    () => renderPlan("ie6.json"),
     (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
   );
 });

@@ -69,6 +69,11 @@ export interface RenderOptions {
   /** burn one text overlay (drawtext) during the same pass — OUTPUT-timeline
    * window like captions, after scale/subtitles so fontsize is in output px */
   overlayText?: OverlayTextOptions;
+  /** burn ONE image (watermark/logo) over the composed output during the same
+   * pass — an ADDITIONAL image input feeding one overlay filter at the
+   * drawtext composition point (after zoom/scale/subtitles/drawtext, before
+   * format / the gif palette graph) on all three paths */
+  imageOverlay?: ImageOverlayOptions;
   /** when set (and the source has audio), mix a music bed under the program
    * audio with speech-keyed sidechain ducking — still one ffmpeg pass
    * (graph validated in docs/ultron/research/r1-audio-mix-single-pass.md) */
@@ -381,6 +386,96 @@ function drawTextFilter(o: OverlayTextOptions): string {
   return `drawtext=${parts.join(":")}`;
 }
 
+// ---- image-overlay (plan op `image-overlay`; ONE overlay filter fed by an
+// ADDITIONAL image input — the audio-mix second-input precedent — composing at
+// the drawtext point on all three paths, still ONE invocation)
+
+/** Fixed corner inset for image-overlay positions (px). Recorded in-task
+ * decision: a CONSTANT margin (not min(W,H)*0.05) — watermark insets are
+ * conventionally constant, and a fixed 16 px is legible at every common
+ * output size without expression commas to escape. */
+export const IMAGE_OVERLAY_MARGIN = 16;
+
+export type ImageOverlayPosition =
+  | "top-left"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-right"
+  | "center";
+
+/** One burned image overlay (plan op `image-overlay`; defaults applied by the
+ * render layer). Times are OUTPUT-timeline seconds; the enable window gates
+ * the overlay on the same composed frames drawtext burns into. */
+export interface ImageOverlayOptions {
+  /** image file; added as a plain additional `-i` (a still frame — overlay's
+   * default eof_action=repeat holds it for the whole program) */
+  file: string;
+  position: ImageOverlayPosition;
+  /** overlay width in output px (keeps aspect via scale=W:-1); undefined =
+   * native image size */
+  width?: number;
+  /** 0 < opacity ≤ 1 (validated at plan time); rides colorchannelmixer=aa */
+  opacity: number;
+  /** visibility window start (s); undefined = from the first frame */
+  from?: number;
+  /** visibility window end (s); undefined = to the last frame */
+  to?: number;
+}
+
+/** overlay-filter x/y expressions per position: W/H = main frame, w/h =
+ * overlay frame (the filter's own constants; measured placing a 120x80 marker
+ * at the exact expected pixels at all five positions on 640x360). */
+export function overlayPositionExpressions(
+  position: ImageOverlayPosition,
+): { x: string; y: string } {
+  const m = IMAGE_OVERLAY_MARGIN;
+  switch (position) {
+    case "top-left": return { x: `${m}`, y: `${m}` };
+    case "top-right": return { x: `W-w-${m}`, y: `${m}` };
+    case "bottom-left": return { x: `${m}`, y: `H-h-${m}` };
+    case "bottom-right": return { x: `W-w-${m}`, y: `H-h-${m}` };
+    case "center": return { x: "(W-w)/2", y: "(H-h)/2" };
+  }
+}
+
+/** The overlay image's own prep chain (one graph link, label → label):
+ * optional width scale with EXACT aspect (`-1`, recorded in-task — the
+ * even-height `-2` rule is an encoder constraint on the MAIN stream, a filter
+ * input has no such constraint), then `format=rgba` (RGBA over the yuv main
+ * needs it on the overlay input ONLY — measured), then the opacity keel
+ * (`colorchannelmixer=aa=`; aa=1 is a uniform no-op, so the chain is emitted
+ * unconditionally — one graph shape for every plan). */
+export function imageOverlayInputChain(
+  o: ImageOverlayOptions,
+  inLabel: string,
+  outLabel: string,
+): string {
+  const parts = [
+    ...(o.width !== undefined ? [`scale=${o.width}:-1`] : []),
+    "format=rgba",
+    `colorchannelmixer=aa=${trimNum(o.opacity)}`,
+  ];
+  return `${inLabel}${parts.join(",")}${outLabel}`;
+}
+
+/** The main-stream overlay filter: fixed-margin position expressions + the
+ * OUTPUT-timeline enable window (omitted bounds unbounded, gte/lte single
+ * bounds, 3-decimal times — drawtext's window semantics verbatim). */
+function imageOverlayFilter(o: ImageOverlayOptions): string {
+  const { x, y } = overlayPositionExpressions(o.position);
+  const parts = [`x=${x}`, `y=${y}`];
+  const window =
+    o.from !== undefined && o.to !== undefined
+      ? `between(t,${o.from.toFixed(3)},${o.to.toFixed(3)})`
+      : o.from !== undefined
+        ? `gte(t,${o.from.toFixed(3)})`
+        : o.to !== undefined
+          ? `lte(t,${o.to.toFixed(3)})`
+          : undefined;
+  if (window) parts.push(`enable='${window}'`);
+  return `overlay=${parts.join(":")}`;
+}
+
 /** The single-pass GIF palette suffix (recipe proven verbatim in vedit's
  * build_gif, vedit.py:363-375 — never a separate palette pass): the
  * from/to OUTPUT-timeline window (trim + renorm, BEFORE fps so the window
@@ -452,8 +547,9 @@ function buildTransitionCommand(
       : []),
     ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
     // yuv420p is the h264/mp4 contract — the gif palette path must not be
-    // forced into it before palettegen
-    ...(opts.gif ? [] : ["format=yuv420p"]),
+    // forced into it before palettegen, and the image-overlay path moves it
+    // AFTER the overlay link (rgba-in/yuv-out needs the last word)
+    ...(opts.gif || opts.imageOverlay ? [] : ["format=yuv420p"]),
   ];
 
   const links: string[] = [];
@@ -475,7 +571,26 @@ function buildTransitionCommand(
     const chain =
       `xfade=transition=${crossfade.kind}:duration=${d}:offset=${t3(offsets[k - 1]!)}` +
       (last && videoTail.length > 0 ? `,${videoTail.join(",")}` : "");
-    links.push(`[${left}][${right}]${chain}[${last ? (opts.gif ? "vx" : "v") : `v${k}`}]`);
+    // with an image-overlay the last link parks at [vc]: the overlay consumes
+    // it and owns the final label ([v], or [vx] handing off to the palette)
+    const lastLabel = last
+      ? opts.imageOverlay
+        ? "vc"
+        : opts.gif
+          ? "vx"
+          : "v"
+      : `v${k}`;
+    links.push(`[${left}][${right}]${chain}[${lastLabel}]`);
+  }
+  if (opts.imageOverlay) {
+    // overlay AFTER the composed chain tail (the drawtext composition point);
+    // the image is input n (the n source inputs precede it); still ONE
+    // invocation — an input, never a second encode
+    links.push(imageOverlayInputChain(opts.imageOverlay, `[${n}:v]`, "[im]"));
+    links.push(
+      `[vc][im]${imageOverlayFilter(opts.imageOverlay)}` +
+        (opts.gif ? "[vx]" : ",format=yuv420p[v]"),
+    );
   }
   if (opts.gif) {
     links.push(`[vx]${gifPaletteChain(opts.gif)}`);
@@ -504,6 +619,7 @@ function buildTransitionCommand(
   for (const seg of segments) {
     argv.push("-ss", t3(seg.start), "-t", t3(seg.end - seg.start), "-i", input);
   }
+  if (opts.imageOverlay) argv.push("-i", opts.imageOverlay.file);
   argv.push("-filter_complex", links.join(";"));
   argv.push("-map", "[v]");
   if (opts.gif) {
@@ -538,7 +654,10 @@ function buildTransitionCommand(
  * path moves into -filter_complex for it, still exactly one invocation.
  * `opts.zoom` inserts a zoompan between `select` and the retime `setpts`
  * (select path / gif select path) or per-input before the xfade links
- * (chain path) — still exactly one invocation, duration frame-exact (R5).
+ * (chain path) — still one invocation, duration frame-exact (R5).
+ * `opts.imageOverlay` composes ONE overlay filter at the drawtext point on
+ * all three paths, fed by an ADDITIONAL image input (the select path flips
+ * into -filter_complex for it) — still exactly one invocation.
  */
 export function buildRenderCommand(
   input: string,
@@ -593,6 +712,25 @@ export function buildRenderCommand(
       ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
       // no format=yuv420p: the palette graph owns the pixel format
     ];
+    if (opts.imageOverlay) {
+      // overlay rides BEFORE the palette suffix (the drawtext point): the gif
+      // window trim inside the suffix stays downstream, so the enable window
+      // addresses the FULL output timeline — consistent with the mp4 paths
+      const graph =
+        `[0:v]${head.join(",")}[vb];` +
+        imageOverlayInputChain(opts.imageOverlay, "[1:v]", "[im]") +
+        ";" +
+        `[vb][im]${imageOverlayFilter(opts.imageOverlay)},${gifPaletteChain(opts.gif)}`;
+      return [
+        "-nostdin", "-hide_banner", "-y",
+        "-i", input,
+        "-i", opts.imageOverlay.file,
+        "-filter_complex", graph,
+        "-map", "[v]",
+        "-an",
+        output,
+      ];
+    }
     const graph = `[0:v]${[...head, gifPaletteChain(opts.gif)].join(",")}`;
     return [
       "-nostdin", "-hide_banner", "-y",
@@ -604,7 +742,7 @@ export function buildRenderCommand(
     ];
   }
 
-  const vf = [
+  const mainChain = [
     `select='${expr}'`,
     ...zoomLink,
     `setpts=N/FRAME_RATE/TB${speed ? `/${trimNum(speed)}` : ""}`,
@@ -616,40 +754,78 @@ export function buildRenderCommand(
         ]
       : []),
     ...(opts.overlayText ? [drawTextFilter(opts.overlayText)] : []),
-    "format=yuv420p",
-  ].join(",");
+    // with an image-overlay, yuv420p moves AFTER the overlay link (rgba-in /
+    // yuv-out — the overlay gets the last word, then the encoder contract)
+    ...(opts.imageOverlay ? [] : ["format=yuv420p"]),
+  ];
+  const vf = mainChain.join(",");
 
   // audio-mix without an audio stream is a silent no-op (validated as a
   // NO_AUDIO_STREAM warning) — never add the bed input or graph then
   const mix = hasAudio && opts.mix ? opts.mix : undefined;
+  const af = hasAudio
+    ? [
+        `aselect='${expr}'`,
+        "asetpts=N/SR/TB",
+        ...(speed ? [atempoChain(speed)] : []),
+        ...(opts.normalizeLufs !== null
+          ? [`loudnorm=I=${opts.normalizeLufs}:TP=-1.5:LRA=11`]
+          : []),
+        ...(opts.volumeDb !== null && opts.volumeDb !== undefined
+          ? [`volume=${trimNum(opts.volumeDb)}dB`]
+          : []),
+      ].join(",")
+    : undefined;
 
   const argv = ["-nostdin", "-hide_banner", "-y", "-i", input];
   if (mix) argv.push("-stream_loop", "-1", "-i", mix.bedFile);
-  argv.push("-vf", vf);
+  // image-overlay is a filter_complex-consuming op (a -vf chain cannot
+  // reference a second input): the image rides the SAME single invocation as
+  // an additional labeled input — the audio-mix second-input precedent. It is
+  // ALWAYS the last input (after the bed when both are present).
+  if (opts.imageOverlay) argv.push("-i", opts.imageOverlay.file);
 
-  if (mix) {
-    // audio moves into -filter_complex; termination is NATURAL (no -shortest,
-    // no -t): video ends at the last kept frame, audio at amix's first input
-    argv.push(
-      "-filter_complex", buildMixFilterGraph(expr, mix, opts, speed),
-      "-map", "0:v", "-map", "[a]",
-      "-c:a", "aac", "-b:a", opts.audioBitrate,
-    );
-  } else if (hasAudio) {
-    const af = [
-      `aselect='${expr}'`,
-      "asetpts=N/SR/TB",
-      ...(speed ? [atempoChain(speed)] : []),
-      ...(opts.normalizeLufs !== null
-        ? [`loudnorm=I=${opts.normalizeLufs}:TP=-1.5:LRA=11`]
-        : []),
-      ...(opts.volumeDb !== null && opts.volumeDb !== undefined
-        ? [`volume=${trimNum(opts.volumeDb)}dB`]
-        : []),
-    ].join(",");
-    argv.push("-af", af, "-c:a", "aac", "-b:a", opts.audioBitrate);
+  if (opts.imageOverlay) {
+    const imageIndex = mix ? 2 : 1;
+    const videoGraph =
+      `[0:v]${vf}[vb];` +
+      imageOverlayInputChain(opts.imageOverlay, `[${imageIndex}:v]`, "[im]") +
+      ";" +
+      `[vb][im]${imageOverlayFilter(opts.imageOverlay)},format=yuv420p[v]`;
+    if (mix) {
+      // ONE -filter_complex carries video + the mix graph; the mix keeps its
+      // validated shape verbatim (video joins it, never the reverse)
+      argv.push(
+        "-filter_complex", `${videoGraph};${buildMixFilterGraph(expr, mix, opts, speed)}`,
+        "-map", "[v]", "-map", "[a]",
+        "-c:a", "aac", "-b:a", opts.audioBitrate,
+      );
+    } else {
+      argv.push("-filter_complex", videoGraph, "-map", "[v]");
+      if (af !== undefined) {
+        // the simple -af chain still carries the audio (measured accepted
+        // alongside a video-only -filter_complex on this build)
+        argv.push("-map", "0:a", "-af", af, "-c:a", "aac", "-b:a", opts.audioBitrate);
+      } else {
+        argv.push("-an");
+      }
+    }
   } else {
-    argv.push("-an");
+    argv.push("-vf", vf);
+
+    if (mix) {
+      // audio moves into -filter_complex; termination is NATURAL (no -shortest,
+      // no -t): video ends at the last kept frame, audio at amix's first input
+      argv.push(
+        "-filter_complex", buildMixFilterGraph(expr, mix, opts, speed),
+        "-map", "0:v", "-map", "[a]",
+        "-c:a", "aac", "-b:a", opts.audioBitrate,
+      );
+    } else if (af !== undefined) {
+      argv.push("-af", af, "-c:a", "aac", "-b:a", opts.audioBitrate);
+    } else {
+      argv.push("-an");
+    }
   }
 
   if (opts.encoder === "libx264") {

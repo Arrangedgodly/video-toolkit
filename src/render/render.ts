@@ -7,6 +7,7 @@ import {
   runFFmpeg,
   type EncoderId,
   type GifExportOptions,
+  type ImageOverlayOptions,
   type MixOptions,
   type ZoomOptions,
 } from "../media/ffmpeg.js";
@@ -124,6 +125,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
   const overlayTextOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "overlay-text" }> =>
       op.type === "overlay-text",
+  );
+  const imageOverlayOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "image-overlay" }> =>
+      op.type === "image-overlay",
   );
   const audioMixOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "audio-mix" }> =>
@@ -269,6 +274,18 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
             fontsize: overlayTextOp.fontsize ?? 48,
             color: overlayTextOp.color ?? "white",
             box: overlayTextOp.box ?? true,
+          }
+        : undefined,
+      // image-overlay defaults: position bottom-right, native size, opacity 1
+      // (pure declaration — no new probes; the builder owns the graph)
+      imageOverlay: imageOverlayOp
+        ? {
+            file: imageOverlayOp.file,
+            position: imageOverlayOp.position ?? "bottom-right",
+            width: imageOverlayOp.width,
+            opacity: imageOverlayOp.opacity ?? 1,
+            from: imageOverlayOp.from,
+            to: imageOverlayOp.to,
           }
         : undefined,
       mix,

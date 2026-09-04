@@ -102,6 +102,7 @@ export async function validatePlan(
       op.type === "volume" ||
       op.type === "captions" ||
       op.type === "overlay-text" ||
+      op.type === "image-overlay" ||
       op.type === "audio-mix" ||
       op.type === "crossfade" ||
       op.type === "export-gif" ||
@@ -156,6 +157,37 @@ export async function validatePlan(
             code: "OPERATION_INVALID",
             operation: i + 1,
             message: `overlay-text: font file not found: ${OVERLAY_FONT_FILE}`,
+          });
+        }
+      }
+      if (op.type === "image-overlay") {
+        // missing image = the captions missing-file pattern (OPERATION_INVALID
+        // with the path), not audio-mix's dedicated code — the dispatch-fixed
+        // plan entry; no new error code
+        try {
+          await stat(op.file);
+        } catch {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: i + 1,
+            path: op.file,
+            message: `image-overlay: image file not found: ${op.file}`,
+          });
+        }
+        // opacity is raw in the schema (zoom.factor pattern) so THIS fence can
+        // say the range: ≤ 0 is invisible-by-definition, > 1 exceeds full
+        if (op.opacity !== undefined && (!(op.opacity > 0) || op.opacity > 1)) {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: i + 1,
+            message: `image-overlay: opacity (${op.opacity}) must be in the range 0 < o ≤ 1 (default 1)`,
+          });
+        }
+        if (op.from !== undefined && op.to !== undefined && op.from >= op.to) {
+          errors.push({
+            code: "RANGE_NEGATIVE",
+            operation: i + 1,
+            message: `image-overlay: from (${op.from}) must be before to (${op.to})`,
           });
         }
       }
@@ -229,6 +261,10 @@ export async function validatePlan(
   const overlayTextOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "overlay-text" }> =>
       op.type === "overlay-text",
+  );
+  const imageOverlayOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "image-overlay" }> =>
+      op.type === "image-overlay",
   );
   const crossfadeOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "crossfade" }> =>
@@ -404,6 +440,25 @@ export async function validatePlan(
         code: "OPERATION_INVALID",
         operation: plan.operations.indexOf(overlayTextOp) + 1,
         message: `overlay-text: to (${overlayTextOp.to}) exceeds expected output duration ${expectedOutput.toFixed(3)}s`,
+      });
+    }
+  }
+
+  // image-overlay `to` consumes the SAME canonical OUTPUT-timeline expectation
+  // (the overlay-text `to` bound verbatim — the enable window cannot outlast
+  // the program it gates)
+  if (imageOverlayOp && imageOverlayOp.to !== undefined) {
+    const speedOp = plan.operations.find(
+      (op): op is Extract<(typeof plan.operations)[number], { type: "speed" }> =>
+        op.type === "speed",
+    );
+    const base = report.expectedDuration ?? report.timelineDuration ?? 0;
+    const expectedOutput = speedOp ? base / speedOp.factor : base;
+    if (imageOverlayOp.to > expectedOutput + DURATION_TOLERANCE) {
+      errors.push({
+        code: "OPERATION_INVALID",
+        operation: plan.operations.indexOf(imageOverlayOp) + 1,
+        message: `image-overlay: to (${imageOverlayOp.to}) exceeds expected output duration ${expectedOutput.toFixed(3)}s`,
       });
     }
   }
