@@ -107,7 +107,7 @@ test("crossfade kind outside the verified allowlist rejected; `custom` parses (f
 
 test("unknown operation type rejected", () => {
   assert.equal(
-    EditPlan.safeParse({ ...base, operations: [{ type: "zoom", start: 0, end: 1 }] }).success,
+    EditPlan.safeParse({ ...base, operations: [{ type: "spin", start: 0, end: 1 }] }).success,
     false,
   );
 });
@@ -225,6 +225,52 @@ test("audio-mix bounds enforced: level dB, LINEAR threshold, duck ranges", () =>
       EditPlan.safeParse({ ...base, operations: [op] }).success,
       false,
       `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+});
+
+// ---- zoom (T18; Ken Burns transform op per R5's committed parameter table,
+// docs/ultron/research/r5-zoom-motion.md — factor ranges are VALIDATE fences
+// (OPERATION_INVALID), so the schema keeps the value raw)
+
+test("zoom parses minimal (all keys optional) and full forms; mode/easing defaults applied", () => {
+  const minimal = EditPlan.parse({ ...base, operations: [{ type: "zoom" }] });
+  const op = minimal.operations[0] as { type: string; mode: string; factor?: number; easing: string };
+  assert.equal(op.type, "zoom");
+  assert.equal(op.mode, "in"); // schema default — always present after parse
+  assert.equal(op.easing, "smooth");
+  assert.equal(op.factor, undefined); // render layer defaults it to 1.2
+
+  const full = EditPlan.parse({
+    ...base,
+    operations: [{ type: "zoom", mode: "left", factor: 1.35, easing: "linear" }],
+  });
+  const f = full.operations[0] as { mode: string; factor: number; easing: string };
+  assert.equal(f.mode, "left");
+  assert.equal(f.factor, 1.35);
+  assert.equal(f.easing, "linear");
+});
+
+test("zoom mode/easing enums enforced; factor stays raw for validate's fence", () => {
+  for (const op of [
+    { type: "zoom", mode: "diagonal" },
+    { type: "zoom", easing: "ease-in-out" },
+    { type: "zoom", factor: "1.5" }, // not a number
+  ]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [op] }).success,
+      false,
+      `expected schema rejection: ${JSON.stringify(op)}`,
+    );
+  }
+  // the factor RANGE is deliberately NOT schema-bounded: 1.0 and 2.5 parse
+  // so validate can reject them with its own OPERATION_INVALID naming the
+  // range (R5's constraints table — tested in ops-integration)
+  for (const factor of [1, 0.5, 2.5, 7]) {
+    assert.equal(
+      EditPlan.safeParse({ ...base, operations: [{ type: "zoom", factor }] }).success,
+      true,
+      `factor ${factor} must parse (validate fences the range)`,
     );
   }
 });

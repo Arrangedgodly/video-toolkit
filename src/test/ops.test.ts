@@ -1,7 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EditPlan } from "../core/schemas.js";
-import { atempoChain, buildRenderCommand, escapeDrawText, escapeFilterPath, type MixOptions } from "../media/ffmpeg.js";
+import {
+  atempoChain,
+  buildRenderCommand,
+  escapeDrawText,
+  escapeFilterPath,
+  zoomExpressions,
+  zoomPanFilter,
+  zoomRampFrames,
+  type MixOptions,
+  type ZoomOptions,
+} from "../media/ffmpeg.js";
 
 const base = {
   version: 1,
@@ -559,4 +569,210 @@ test("builder: export-gif refusals — non-.gif output and the audio-mix combo",
     () => buildRenderCommand("in.mp4", segs, "out.gif", { ...opts, gif: { width: 480, fps: 12 }, mix }, true),
     (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
   );
+});
+
+// ---- zoom (Ken Burns single-pass motion; graph + expressions validated in
+// docs/ultron/research/r5-zoom-motion.md — R5's binding table transcribed
+// into zoomExpressions/zoomPanFilter; both render paths compose it INSIDE
+// the one invocation)
+
+const zx = (mode: ZoomOptions["mode"], easing: ZoomOptions["easing"] = "smooth", factor = 1.5): ZoomOptions => ({
+  mode, easing, factor, srcFps: 30, srcWidth: 1280, srcHeight: 720,
+});
+
+test("zoomExpressions: R5's binding table verbatim (all six modes, both easings)", () => {
+  // the record's exact validated parameters: zoom-in, F=1.5, N=210 — the
+  // z ramp 1+0.5*min(on/209,1) equals the validated min(1+0.5*on/209,1.5)
+  // term-for-term (the clamp pushed inside the affine)
+  assert.deepEqual(zoomExpressions("in", 1.5, "linear", 210), {
+    z: "1+0.5*min(on/209,1)",
+    x: "iw/2-(iw/zoom/2)",
+    y: "ih/2-(ih/zoom/2)",
+  });
+  // smooth easing = smoothstep 3p²−2p³ over the clamped progress
+  assert.equal(zoomExpressions("in", 1.5, "smooth", 210).z, "1+0.5*min(on/209,1)*min(on/209,1)*(3-2*min(on/209,1))");
+  // zoom-out reverses the ramp: 1+(F-1)*(1-e(p)) — F=1.3 formats as 0.3
+  // despite 1.3-1 being 0.30000000000000004 in float (trimNum's 4 decimals)
+  assert.equal(zoomExpressions("out", 1.3, "linear", 90).z, "1+0.3*(1-min(on/89,1))");
+  // pans: CONSTANT zoom at F, full-range traverse on one axis, centered on
+  // the other; camera direction (right = content drifts left)
+  assert.deepEqual(zoomExpressions("right", 1.2, "linear", 180), {
+    z: "1.2",
+    x: "(iw-iw/zoom)*min(on/179,1)",
+    y: "ih/2-(ih/zoom/2)",
+  });
+  assert.deepEqual(zoomExpressions("left", 1.2, "linear", 180), {
+    z: "1.2",
+    x: "(iw-iw/zoom)*(1-min(on/179,1))",
+    y: "ih/2-(ih/zoom/2)",
+  });
+  assert.deepEqual(zoomExpressions("down", 1.2, "smooth", 180), {
+    z: "1.2",
+    x: "iw/2-(iw/zoom/2)",
+    y: "(ih-ih/zoom)*min(on/179,1)*min(on/179,1)*(3-2*min(on/179,1))",
+  });
+  assert.deepEqual(zoomExpressions("up", 1.2, "linear", 180), {
+    z: "1.2",
+    x: "iw/2-(iw/zoom/2)",
+    y: "(ih-ih/zoom)*(1-min(on/179,1))",
+  });
+});
+
+test("zoomExpressions: ABSOLUTE on-frame expressions only — the classic incremental recipes are fenced out", () => {
+  // R5 D1a/D1b (measured): `zoom+step` is a SILENT NO-OP with d=1 on this
+  // build and `pzoom+step` runs away — a regression to either would make
+  // every zoom plan render no motion while staying green on duration
+  for (const mode of ["in", "out", "left", "right", "up", "down"] as const) {
+    for (const easing of ["smooth", "linear"] as const) {
+      const { z, x, y } = zoomExpressions(mode, 1.5, easing, 210);
+      for (const expr of [z, x, y]) {
+        assert.ok(!expr.includes("zoom+"), `${mode}/${easing}: incremental zoom+ is a measured no-op: ${expr}`);
+        assert.ok(!expr.includes("pzoom"), `${mode}/${easing}: pzoom compounds uncontrollably: ${expr}`);
+      }
+      assert.ok(z.startsWith("1+") || /^[0-9.]+$/.test(z), `${mode}/${easing}: z must be absolute: ${z}`);
+      assert.ok(z.includes("on/") || /^[0-9.]+$/.test(z), `${mode}/${easing}: ramps parameterize the output frame counter: ${z}`);
+    }
+  }
+});
+
+test("zoomRampFrames: N = max(2, round(dur×fps)) — whole timeline (select) / per segment (chain)", () => {
+  assert.equal(zoomRampFrames(7.0, 30), 210); // R5's select-path instance
+  assert.equal(zoomRampFrames(3.0, 30), 90); // R5's F2 segment 1
+  assert.equal(zoomRampFrames(4.0, 30), 120); // R5's F2 segment 2
+  assert.equal(zoomRampFrames(0.02, 30), 2); // sub-2-frame unit floors (validate rejects it first)
+  assert.equal(zoomRampFrames(6.006, 30000 / 1001), 180); // rational fps passes through numerically
+});
+
+test("zoomPanFilter: d=1 + probed fps + explicit s= always; ×2 prescale for PAN modes only", () => {
+  // zoom modes: NO prescale — the discipline string verbatim
+  assert.equal(
+    zoomPanFilter(zx("in", "linear"), 210),
+    "zoompan=z='1+0.5*min(on/209,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720",
+  );
+  assert.equal(
+    zoomPanFilter(zx("out", "linear"), 210),
+    "zoompan=z='1+0.5*(1-min(on/209,1))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720",
+  );
+  // pan modes: scale=2W:2H rides BEFORE zoompan (native-res pans judder —
+  // half the frames frozen on the integer crop origin; E5's mitigation)
+  assert.equal(
+    zoomPanFilter(zx("right", "linear", 1.2), 210),
+    "scale=2560:1440,zoompan=z='1.2':x='(iw-iw/zoom)*min(on/209,1)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720",
+  );
+  // the three defaults this build silently substitutes — d=90 (×108
+  // duration), fps=25 (silent re-time), s=hd720 (silent resize) — are never
+  // reachable: d=1, the probed fps, and the source WxH are hardwired
+  const pan = zoomPanFilter(zx("down", "smooth", 1.2), 210);
+  assert.ok(pan.includes(":d=1:fps=30:s=1280x720"), pan);
+});
+
+test("builder: select-path zoom sits between select and the retime setpts (R5 C4/C5)", () => {
+  const argv = buildRenderCommand("in.mp4", [{ start: 1, end: 4 }, { start: 5.5, end: 9.5 }], "out.mp4", {
+    ...opts, zoom: zx("in", "linear", 1.5),
+  }, true);
+  const vf = argv[argv.indexOf("-vf") + 1]!;
+  const iSelect = vf.indexOf("select=");
+  const iZoom = vf.indexOf("zoompan=");
+  const iSetpts = vf.indexOf("setpts=");
+  assert.ok(iSelect !== -1 && iZoom !== -1 && iSetpts !== -1, vf);
+  assert.ok(iSelect < iZoom && iZoom < iSetpts, `zoompan must sit between select and setpts: ${vf}`);
+  // one continuous 210-frame ramp over the WHOLE 7.0s timeline (union of
+  // both segments — zoompan runs before the speed retime, so N is unscaled)
+  assert.ok(vf.includes("zoompan=z='1+0.5*min(on/209,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720"), vf);
+  // still ONE invocation with the plain -vf path (no complex graph)
+  assert.equal(argv.includes("-filter_complex"), false);
+  assert.equal(argv.filter((a) => a === "-i").length, 1);
+});
+
+test("builder: zoom + speed composes with speed AFTER zoompan (zoompan discards input PTS)", () => {
+  const argv = buildRenderCommand("in.mp4", [{ start: 0, end: 7 }], "out.mp4", {
+    ...opts, zoom: zx("in", "linear", 1.5), speedFactor: 1.25,
+  }, true);
+  const vf = argv[argv.indexOf("-vf") + 1]!;
+  assert.ok(vf.indexOf("zoompan=") < vf.indexOf("setpts=N/FRAME_RATE/TB/1.25"), vf);
+  // audio is untouched by zoompan — the ordinary aselect/atempo chain rides -af
+  assert.ok(argv[argv.indexOf("-af") + 1]!.includes("atempo=1.25"));
+  assert.ok(!argv.join(" ").includes("azoompan"));
+});
+
+test("builder: transition chain zoompans EVERY input uniformly before the xfade links (R5 F2/F2b)", () => {
+  // R5's exact F2 instance parameters: N=2, F=1.3 per segment, D=0.5 —
+  // per-input ramps N_1=90 (3.0s) and N_2=120 (4.0s)
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 1, end: 4 }, { start: 5.5, end: 9.5 }],
+    "out.mp4",
+    { ...opts, zoom: zx("in", "linear", 1.3), crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  assert.equal(
+    graph,
+    "[0:v]zoompan=z='1+0.3*min(on/89,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720[z0];" +
+      "[1:v]zoompan=z='1+0.3*min(on/119,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=1280x720[z1];" +
+      "[z0][z1]xfade=transition=fade:duration=0.500:offset=2.500,format=yuv420p[v];" +
+      "[0:a][1:a]acrossfade=d=0.500[a]",
+    graph,
+  );
+  // xfade links consume the zoompan outputs, never the raw inputs; the audio
+  // chain never touches zoompan (R3's chain verbatim)
+  assert.ok(!graph.includes("[0:v][1:v]"), graph);
+  assert.equal(argv.filter((a) => a === "-filter_complex").length, 1);
+  assert.equal(argv.filter((a) => a === "-i").length, 2);
+});
+
+test("builder: chain-path PAN zoom carries the ×2 prescale per input; speed tail unchanged", () => {
+  const argv = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    {
+      ...opts,
+      zoom: zx("right", "smooth", 1.2),
+      crossfade: { duration: 0.5, kind: "wipeleft" },
+      speedFactor: 2,
+    },
+    true,
+  );
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  // per-input: scale=2W:2H, then zoompan at the source s=; uniform on BOTH inputs
+  for (const k of [0, 1]) {
+    assert.ok(graph.includes(`[${k}:v]scale=2560:1440,zoompan=z='1.2'`), graph);
+    assert.ok(graph.includes(`:d=1:fps=30:s=1280x720[z${k}]`), graph);
+  }
+  // speed still composes AFTER the chain (R3), audio untouched by zoompan
+  assert.ok(graph.includes("xfade=transition=wipeleft:duration=0.500:offset=2.500,setpts=PTS/2,"), graph);
+  assert.ok(graph.includes("acrossfade=d=0.500,atempo=2"), graph);
+});
+
+test("builder: export-gif path composes zoom BEFORE the palette suffix (T19 order note)", () => {
+  const argv = buildRenderCommand("in.mp4", segs, "out.gif", {
+    ...opts, zoom: zx("in", "linear", 1.5), gif: { width: 480, fps: 12 },
+  }, true);
+  const graph = argv[argv.indexOf("-filter_complex") + 1]!;
+  const order = ["select=", "zoompan=", "setpts=N/FRAME_RATE/TB", "fps=12,scale=480:-2:flags=lanczos"];
+  let prev = -1;
+  for (const part of order) {
+    const at = graph.indexOf(part);
+    assert.ok(at !== -1, `${part} missing: ${graph}`);
+    assert.ok(at > prev, `${part} must come after the previous stage: ${graph}`);
+    prev = at;
+  }
+  assert.ok(graph.includes("palettegen=stats_mode=diff"), graph);
+});
+
+test("builder: plans WITHOUT the zoom op produce byte-identical commands (the verbatim no-zoom locks above pin both paths)", () => {
+  // explicit canary alongside those locks: the same select and chain inputs
+  // with zoom ABSENT contain no zoompan/prescale anywhere
+  const select = buildRenderCommand("in.mp4", segs, "out.mp4", opts, true);
+  assert.ok(!select.join(" ").includes("zoompan"));
+  const chain = buildRenderCommand(
+    "in.mp4",
+    [{ start: 0, end: 3 }, { start: 5, end: 8.5 }],
+    "out.mp4",
+    { ...opts, crossfade: { duration: 0.5, kind: "fade" } },
+    true,
+  );
+  assert.ok(!chain.join(" ").includes("zoompan"));
+  assert.ok(!chain.join(" ").includes("scale=2560:1440"));
 });

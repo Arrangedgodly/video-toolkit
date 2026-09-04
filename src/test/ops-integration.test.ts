@@ -18,6 +18,9 @@ const BLOCKS = "blocks.mp4"; // 15s, 640x360@30: red[0,5)+440Hz, green[5,10)+880
 //                            blue[10,15)+1320Hz — R3's transition fixture shape
 const XFK = "xfk.mp4"; // 2.6s, 320x180@25: red[0,1.3)+440Hz, green[1.3,2.6)+880Hz
 //                      — T17's tiny kind-sweep fixture (2 keep-segments via a cut)
+const BARX = "barx.mp4"; // 10s, 640x360@30: black + full-height WHITE 24px bar at
+//                        x=308..331 (center 320) + 440Hz tone — R5's bar-marker
+//                        fixture shape (the zoom/pan visual-evidence probe)
 let dir = "";
 
 before(async () => {
@@ -99,6 +102,20 @@ before(async () => {
     "-c:a", "aac", "-b:a", "128k", XFK,
   ]);
   assert.equal(r7.code, 0, r7.stderr);
+
+  // R5's bar fixture (docs/ultron/research/r5-zoom-motion.md): a full-height
+  // white bar on black is the marker cropdetect-style measurement needs (a
+  // small marker is invisible to average-based probes; the bar's column
+  // profile gives center + width per frame)
+  const r8 = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=black:s=640x360:r=30:d=10",
+    "-f", "lavfi", "-i", "sine=f=440:r=44100:d=10",
+    "-vf", "drawbox=x=308:y=0:w=24:h=360:color=white:t=fill",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", BARX,
+  ]);
+  assert.equal(r8.code, 0, r8.stderr);
 });
 
 after(async () => {
@@ -998,5 +1015,280 @@ test("export-gif validation: terminal position, window bounds (speed-aware), dup
     e8.warnings.some((w) => w.code === "GIF_AUDIO_DROPPED"),
     false,
     JSON.stringify(e8.warnings),
+  );
+});
+
+// ---- zoom (T18; single-pass Ken Burns motion on BOTH render paths per R5's
+// committed contract, docs/ultron/research/r5-zoom-motion.md — every duration
+// claim below is measured against a SAME-PLAN-WITHOUT-ZOOM control, never
+// the nominal timeline: the select path's inclusive `between` emits +1 frame
+// per segment (keep [1,4]+[5.5,9.5] = 212 frames / 7.0667 s, the record's C0)
+
+function barPlan(operations: unknown[], output = "z.mp4"): unknown {
+  return { version: 1, source: BARX, operations, output: { path: output } };
+}
+
+const ZOOM_TRIMS = [
+  { type: "trim", start: 1, end: 4 },
+  { type: "trim", start: 5.5, end: 9.5 },
+];
+
+/** column profile of the full-height bar marker in one decoded frame — the
+ * visual-evidence probe (center + width; detector slop ±1-2 px on the edges,
+ * far below every asserted delta). */
+async function barProfile(file: string, t: number): Promise<{ center: number; width: number }> {
+  const r = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-ss", String(t), "-i", file,
+    "-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "bar-t18.raw",
+  ]);
+  assert.equal(r.code, 0, r.stderr);
+  const buf = await readFile("bar-t18.raw");
+  const W = 640;
+  const H = 360;
+  let xMin = -1;
+  let xMax = -1;
+  for (let x = 0; x < W; x++) {
+    let bright = 0;
+    for (let y = 0; y < H; y++) if (buf[y * W + x]! > 128) bright++;
+    if (bright > H / 2) {
+      if (xMin === -1) xMin = x;
+      xMax = x;
+    }
+  }
+  assert.ok(xMin !== -1, `bar marker not found at t=${t}`);
+  return { center: (xMin + xMax) / 2, width: xMax - xMin + 1 };
+}
+
+test("zoom: select-path render is ONE invocation, duration FRAME-EXACT vs the no-zoom control, visible zoom-in", async () => {
+  const p = await writePlan("z1.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "zoom", mode: "in", factor: 1.5, easing: "linear" },
+  ], "z1.mp4"));
+  const control = await writePlan("z1c.json", barPlan([...ZOOM_TRIMS], "z1c.mp4"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+  // visual-only op: zoom never enters a duration law (no new report fields)
+  assert.equal(v.expectedDuration, undefined);
+  assert.ok(Math.abs((v.timelineDuration ?? 0) - 7) < 0.01);
+
+  const r = await renderPlan(p);
+  // INVARIANT 1: exactly ONE ffmpeg invocation, plain -vf path
+  assert.equal(r.command[0], "ffmpeg");
+  assert.equal(r.command.filter((a) => a === "-i").length, 1);
+  assert.equal(r.command.includes("-filter_complex"), false);
+  const vf = r.command[r.command.indexOf("-vf") + 1]!;
+  // one continuous ramp over the WHOLE timeline (N = round(7.0×30) = 210),
+  // the R5 discipline string verbatim, between select and the retime setpts
+  assert.ok(
+    vf.includes("zoompan=z='1+0.5*min(on/209,1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=640x360"),
+    vf,
+  );
+  assert.ok(
+    vf.indexOf("select=") < vf.indexOf("zoompan=") && vf.indexOf("zoompan=") < vf.indexOf("setpts="),
+    `zoompan must sit between select and setpts: ${vf}`,
+  );
+
+  // DURATION INVARIANCE, frame-exact (the record's C0/C3 pair: 212/212):
+  // the no-op default d=90 would blow this to 19,080 frames
+  const rc = await renderPlan(control);
+  assert.equal(await probeStreamField(r.output, "nb_frames"), "212");
+  assert.equal(await probeStreamField(rc.output, "nb_frames"), "212");
+  assert.ok(
+    Math.abs(r.outputDuration - rc.outputDuration) < 0.02,
+    `duration must equal the no-zoom control: ${r.outputDuration} vs ${rc.outputDuration}`,
+  );
+
+  // VISUAL EVIDENCE: the marker grows 24 px -> 36 px (F=1.5) while its
+  // CENTER stays anchored — an incremental-expression regression (the
+  // classic no-op) would leave the width at ~24 and fail this
+  const early = await barProfile(r.output, 0.2);
+  const mid = await barProfile(r.output, 3.5);
+  const late = await barProfile(r.output, 6.8);
+  assert.ok(early.width < mid.width + 2 && mid.width < late.width + 2, `monotonic growth: ${early.width} ${mid.width} ${late.width}`);
+  assert.ok(late.width - early.width > 8, `zoom-in must grow the marker: ${early.width} -> ${late.width}`);
+  for (const probe of [early, mid, late]) {
+    assert.ok(Math.abs(probe.center - 320) <= 3, `center-anchored zoom wobble ≤ ±3 px: ${probe.center}`);
+  }
+});
+
+test("zoom: pan right drifts the content LEFT (camera convention), prescaled; frame-exact invariance + preview parity", async () => {
+  const p = await writePlan("z2.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "zoom", mode: "right", factor: 1.2, easing: "linear" },
+  ], "z2.mp4"));
+  const control = await writePlan("z2c.json", barPlan([...ZOOM_TRIMS], "z2c.mp4"));
+  const r = await renderPlan(p);
+  const vf = r.command[r.command.indexOf("-vf") + 1]!;
+  // PAN modes carry the ×2 prescale before zoompan; z is the CONSTANT F
+  assert.ok(
+    vf.includes("scale=1280:720,zoompan=z='1.2':x='(iw-iw/zoom)*min(on/209,1)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=640x360"),
+    vf,
+  );
+  // duration invariance, frame-exact
+  const rc = await renderPlan(control);
+  assert.equal(await probeStreamField(r.output, "nb_frames"), "212");
+  assert.equal(await probeStreamField(rc.output, "nb_frames"), "212");
+
+  // VISUAL EVIDENCE: camera pans right => content drifts LEFT, monotonic,
+  // full traverse (1−1/1.2)·640 ≈ 107 px (samples span the ramp)
+  const a = await barProfile(r.output, 0.3);
+  const b = await barProfile(r.output, 3.5);
+  const c = await barProfile(r.output, 6.7);
+  assert.ok(a.center > b.center + 20, `drift left: ${a.center} -> ${b.center}`);
+  assert.ok(b.center > c.center + 20, `drift continues: ${b.center} -> ${c.center}`);
+  assert.ok(a.center - c.center > 60, `full-range pan: net drift ${a.center - c.center} px (ideal ~107)`);
+
+  // preview parity: same motion at preview settings, isolated path
+  const pv = await renderPlan(p, { mode: "preview" });
+  assert.ok(pv.output.endsWith("z2.preview.mp4"), pv.output);
+  const pvf = pv.command[pv.command.indexOf("-vf") + 1]!;
+  assert.ok(pvf.includes("zoompan=z='1.2'"), pvf);
+  assert.ok(pvf.indexOf("zoompan=") < pvf.indexOf("scale=640:-2"), `preview scale comes after the motion: ${pvf}`);
+  assert.ok(Math.abs(pv.outputDuration - r.outputDuration) < 0.05);
+});
+
+test("zoom: crossfade chain zoompans EVERY input with its own ramp; R3's duration law frame-exact", async () => {
+  // R5's exact F2 composition: N=2, F=1.3 per segment, D=0.5 — per-input
+  // ramps N_1=90 (L=3.0) and N_2=120 (L=4.0), xfade over the [z0][z1] outputs
+  const p = await writePlan("z3.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "crossfade", duration: 0.5 },
+    { type: "zoom", mode: "in", factor: 1.3, easing: "linear" },
+  ], "z3.mp4"));
+  const control = await writePlan("z3c.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "crossfade", duration: 0.5 },
+  ], "z3c.mp4"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+
+  const r = await renderPlan(p);
+  // ONE invocation, 2 inputs of the SAME source, zoompan on BOTH inputs
+  assert.equal(r.command.filter((a) => a === "-i").length, 2);
+  assert.equal(r.command.filter((a) => a === "-filter_complex").length, 1);
+  const graph = r.command[r.command.indexOf("-filter_complex") + 1]!;
+  assert.ok(graph.startsWith("[0:v]zoompan=z='1+0.3*min(on/89,1)'"), graph);
+  assert.ok(graph.includes("zoompan=z='1+0.3*min(on/119,1)'"), graph);
+  assert.ok(graph.includes("[z0][z1]xfade=transition=fade:duration=0.500:offset=2.500"), graph);
+
+  // DURATION LAW frame-exact: timeline 7.0 − 0.5 = 6.5 s = 195 frames,
+  // identical to the no-zoom crossfade control (the record's F1/F2 pair)
+  const rc = await renderPlan(control);
+  assert.equal(await probeStreamField(r.output, "nb_frames"), "195");
+  assert.equal(await probeStreamField(rc.output, "nb_frames"), "195");
+  assert.ok(Math.abs(r.outputDuration - 6.5) < 0.04, `duration ${r.outputDuration}`);
+  assert.ok(Math.abs(r.outputDuration - rc.outputDuration) < 0.02);
+
+  // VISUAL EVIDENCE: motion re-runs per segment (the reset at the join is
+  // the documented chain-path semantic) — the bar grows within segment 2
+  const early = await barProfile(r.output, 0.2);
+  const late = await barProfile(r.output, 6.2);
+  assert.ok(late.width > early.width + 4, `per-segment zoom-in: ${early.width} -> ${late.width}`);
+});
+
+test("zoom composes with speed + captions + overlay-text in the SAME single pass (R5's G1 matrix)", async () => {
+  await writeFile("z4.srt", "1\n00:00:00,000 --> 00:00:02,000\nHELLO ZOOM\n");
+  const p = await writePlan("z4.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "zoom", mode: "in", factor: 1.3 }, // defaults exercised: easing smooth
+    { type: "speed", factor: 1.25 },
+    { type: "captions", file: "z4.srt" },
+    { type: "overlay-text", text: "Title", from: 0.5, to: 3 },
+  ], "z4.mp4"));
+  const control = await writePlan("z4c.json", barPlan([
+    ...ZOOM_TRIMS,
+    { type: "speed", factor: 1.25 },
+    { type: "captions", file: "z4.srt" },
+    { type: "overlay-text", text: "Title", from: 0.5, to: 3 },
+  ], "z4c.mp4"));
+  const v = await validatePlan(p);
+  assert.equal(v.valid, true, JSON.stringify(v.errors));
+
+  const r = await renderPlan(p);
+  assert.equal(r.command[0], "ffmpeg");
+  assert.equal(r.command.filter((a) => a === "-i").length, 1);
+  assert.equal(r.command.includes("-filter_complex"), false);
+  // composition order (R5): motion EARLY, text LATE — zoompan < setpts/speed
+  // < subtitles < drawtext < format, all inside the one -vf
+  const vf = r.command[r.command.indexOf("-vf") + 1]!;
+  const order = ["select=", "zoompan=", "setpts=N/FRAME_RATE/TB/1.25", "subtitles=", "drawtext=", "format=yuv420p"];
+  let prev = -1;
+  for (const part of order) {
+    const at = vf.indexOf(part);
+    assert.ok(at !== -1, `${part} missing: ${vf}`);
+    assert.ok(at > prev, `${part} must come after the previous stage: ${vf}`);
+    prev = at;
+  }
+  // smooth easing rides the graph (the default)
+  assert.ok(vf.includes("zoompan=z='1+0.3*min(on/209,1)*min(on/209,1)*(3-2*min(on/209,1))'"), vf);
+
+  // duration law through the full stack (the record's C7: zoom+speed =
+  // 170 f / 5.666667 s — the speed law alone governs). At FRACTIONAL speeds
+  // the trailing frame is path-sensitive within ONE frame (zoompan
+  // regenerates PTS at exact 1/fps steps; the plain select path carries
+  // container rounding — measured plain 171/5.700 vs zoom 170/5.6667): the
+  // record's own tolerance ("frame-exact or ≤1 frame") governs here, while
+  // the exact-count invariance lives in the no-speed tests above
+  const rc = await renderPlan(control);
+  assert.ok(
+    Math.abs(Number(await probeStreamField(r.output, "nb_frames")) - 212 / 1.25) <= 1,
+    `zoom frame count vs 212/1.25`,
+  );
+  assert.ok(
+    Math.abs(r.outputDuration - rc.outputDuration) <= 1 / 30 + 0.01,
+    `zoom must not re-time the composition: ${r.outputDuration} vs control ${rc.outputDuration}`,
+  );
+  assert.ok(Math.abs(r.outputDuration - 7.0667 / 1.25) < 0.05, `duration ${r.outputDuration}`);
+});
+
+test("zoom validation: factor range, duplicates, sub-2-frame ramp units; render throws the code", async () => {
+  // factor fences (R5's constraints table — strict 1.0 < f ≤ 2.0)
+  for (const factor of [1, 0.5, 2.5]) {
+    const r = await validatePlan(await writePlan(`ze-f${factor}.json`, barPlan([
+      { type: "trim", start: 0, end: 4 },
+      { type: "zoom", factor },
+    ])));
+    assert.equal(r.valid, false, `factor ${factor} must be fenced`);
+    assert.equal(r.errors[0]?.code, "OPERATION_INVALID");
+    assert.ok(r.errors[0]?.message.includes("1.0 < f ≤ 2.0"), r.errors[0]?.message);
+  }
+  // boundaries are legal: exactly 2.0, just above 1.0
+  for (const factor of [2, 1.001]) {
+    const r = await validatePlan(await writePlan(`ze-ok${factor}.json`, barPlan([
+      { type: "trim", start: 0, end: 4 },
+      { type: "zoom", factor },
+    ])));
+    assert.equal(r.valid, true, JSON.stringify(r.errors));
+  }
+
+  // duplicate zoom joins the seenTransforms rule
+  const dup = await validatePlan(await writePlan("ze-dup.json", barPlan([
+    { type: "trim", start: 0, end: 4 },
+    { type: "zoom" },
+    { type: "zoom", mode: "left" },
+  ])));
+  assert.equal(dup.valid, false);
+  assert.equal(dup.errors[0]?.code, "OPERATION_INVALID");
+  assert.equal(dup.errors[0]?.operation, 3);
+
+  // ramp-unit fence: a 0.02 s timeline at 30 fps = 1 frame (exit-0
+  // degenerate render upstream — fenced client-side instead)
+  const tiny = await validatePlan(await writePlan("ze-tiny.json", barPlan([
+    { type: "trim", start: 0, end: 0.02 },
+    { type: "zoom" },
+  ])));
+  assert.equal(tiny.valid, false);
+  assert.equal(tiny.errors[0]?.code, "OPERATION_INVALID");
+  assert.ok(tiny.errors[0]?.message.includes("2 source frames"), tiny.errors[0]?.message);
+
+  // the fences hold on the render path too (render re-validates)
+  await assert.rejects(
+    () => renderPlan("ze-f2.5.json"),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
+  );
+  await assert.rejects(
+    () => renderPlan("ze-tiny.json"),
+    (e: unknown) => (e as { code?: string }).code === "OPERATION_INVALID",
   );
 });

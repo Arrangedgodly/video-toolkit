@@ -8,6 +8,7 @@ import {
   type EncoderId,
   type GifExportOptions,
   type MixOptions,
+  type ZoomOptions,
 } from "../media/ffmpeg.js";
 import { inspectFile } from "../media/ffprobe.js";
 import { adjustedDuration } from "../core/timeline.js";
@@ -136,6 +137,10 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
     (op): op is Extract<(typeof plan.operations)[number], { type: "export-gif" }> =>
       op.type === "export-gif",
   );
+  const zoomOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "zoom" }> =>
+      op.type === "zoom",
+  );
   const hasAudio = report.media.audio != null;
   const speedFactor = speedOp?.factor;
 
@@ -152,6 +157,25 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
       }
     : undefined;
   const audioActive = hasAudio && !gif;
+
+  // zoom plumbing is pure declaration (R5's implementation consequence #4):
+  // mode/easing carry schema defaults, factor defaults to 1.2, and the
+  // source facts come from the ALREADY-PROBED media info (the mix bed's
+  // speechSampleRate precedent — no new probes). Visual-only op: nothing in
+  // the duration/progress/verify math below changes (zoom never enters a
+  // duration law).
+  let zoom: ZoomOptions | undefined;
+  if (zoomOp && report.media.video) {
+    const v = report.media.video;
+    zoom = {
+      mode: zoomOp.mode,
+      factor: zoomOp.factor ?? 1.2,
+      easing: zoomOp.easing,
+      srcFps: v.fps,
+      srcWidth: v.width,
+      srcHeight: v.height,
+    };
+  }
 
   // resize and preview both scale; when both apply, use the smaller width so
   // preview stays cheap — unless the resize is exact (w×h), which wins.
@@ -254,6 +278,9 @@ export async function renderPlan(planPath: string, opts: RenderOpts = {}): Promi
         : undefined,
       // terminal export op: the single-pass palette graph + gif muxer
       gif,
+      // Ken Burns motion (R5): zoompan between select and the retime setpts
+      // (select/gif path) or per-input before the xfade links (chain path)
+      zoom,
     },
     hasAudio,
   );

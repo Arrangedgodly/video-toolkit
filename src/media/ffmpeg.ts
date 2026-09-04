@@ -87,6 +87,14 @@ export interface RenderOptions {
    * and is never used). Audio is dropped (-an); h264/movflags are omitted
    * (gif muxer). */
   gif?: GifExportOptions;
+  /** when set, Ken Burns camera motion rides the SAME single pass (plan op
+   * `zoom`; graph validated in docs/ultron/research/r5-zoom-motion.md):
+   * select path — one zoompan over the re-timed stream, between `select`
+   * and the retime `setpts` (zoompan DISCARDS input PTS, so speed must come
+   * after); chain path — one zoompan per input before the xfade links (ALL
+   * inputs uniformly — mixed zoompan/plain inputs fail loudly). Duration
+   * invariance is frame-exact: d=1 + fps=source + s=source WxH. */
+  zoom?: ZoomOptions;
 }
 
 /** Terminal export op `export-gif` (defaults applied by the render layer). */
@@ -99,6 +107,95 @@ export interface GifExportOptions {
   from?: number;
   /** window end on the OUTPUT timeline (s); undefined = to the end */
   to?: number;
+}
+
+export type ZoomMode = "in" | "out" | "left" | "right" | "up" | "down";
+export type ZoomEasing = "smooth" | "linear";
+
+/** Ken Burns motion (plan op `zoom`; defaults applied by the render layer).
+ * The source facts (fps/W/H) ride the same object — already-probed media
+ * info, never a new probe (R5's implementation consequence #4). */
+export interface ZoomOptions {
+  /** CAMERA direction; `in`/`out` = center-anchored zoom, pans = constant
+   * zoom with a full-range traverse */
+  mode: ZoomMode;
+  /** zoom level, 1.0 < f ≤ 2.0 (validated at plan time) */
+  factor: number;
+  easing: ZoomEasing;
+  /** probed source fps — passed to zoompan VERBATIM (never its 25 default:
+   * a wrong fps silently re-times the output) */
+  srcFps: number;
+  /** probed source width (px) — zoompan `s=` and the pan prescale */
+  srcWidth: number;
+  /** probed source height (px) */
+  srcHeight: number;
+}
+
+/** Ramp frame count for one motion unit (R5): N = max(2, round(dur×fps)).
+ * Select path: one unit = the whole timeline; chain path: one unit PER
+ * keep-segment. The max(2,…) floor keeps `on/(N−1)` evaluable; validate
+ * rejects the sub-2-frame units that would actually reach it. */
+export function zoomRampFrames(durationSeconds: number, fps: number): number {
+  return Math.max(2, Math.round(durationSeconds * fps));
+}
+
+/** The absolute `on`-frame z/x/y expressions for one motion unit (R5's
+ * binding table, pure functions of F, N, on). p = min(on/(N−1),1) absorbs
+ * the select path's inclusive-`between` +1 frame per segment (the ramp
+ * holds at its end value for the ≤2 trailing frames); easing e(p) = p
+ * (linear) or 3p²−2p³ (smooth). ABSOLUTE ONLY: the classic incremental
+ * `zoom+step` recipe is a measured silent NO-OP with d=1 on this build and
+ * `pzoom+step` runs away — never emit either. */
+export function zoomExpressions(
+  mode: ZoomMode,
+  factor: number,
+  easing: ZoomEasing,
+  rampFrames: number,
+): { z: string; x: string; y: string } {
+  const last = Math.max(1, rampFrames - 1);
+  const p = `min(on/${last},1)`;
+  const e = easing === "linear" ? p : `${p}*${p}*(3-2*${p})`;
+  const f = trimNum(factor);
+  const range = trimNum(factor - 1);
+  const cx = "iw/2-(iw/zoom/2)";
+  const cy = "ih/2-(ih/zoom/2)";
+  switch (mode) {
+    case "in":
+      return { z: `1+${range}*${e}`, x: cx, y: cy };
+    case "out":
+      return { z: `1+${range}*(1-${e})`, x: cx, y: cy };
+    case "right":
+      return { z: f, x: `(iw-iw/zoom)*${e}`, y: cy };
+    case "left":
+      return { z: f, x: `(iw-iw/zoom)*(1-${e})`, y: cy };
+    case "down":
+      return { z: f, x: cx, y: `(ih-ih/zoom)*${e}` };
+    case "up":
+      return { z: f, x: cx, y: `(ih-ih/zoom)*(1-${e})` };
+  }
+}
+
+function isPanMode(mode: ZoomMode): boolean {
+  return mode === "left" || mode === "right" || mode === "up" || mode === "down";
+}
+
+/** One zoompan chain link (R5's committed discipline): `d=1` (one output
+ * frame per input frame — NEVER the 90 default, ×108 duration blowup),
+ * `fps=<probed source fps>` (NOT the 25 default — silent re-time),
+ * `s=<source WxH>` (NOT the hd720 default — silent resize). PAN modes get a
+ * ×2 prescale first (native-res pans stall/jump on the integer crop origin:
+ * half the frames frozen; the prescale hands the scaler sub-pixel steps).
+ * Inside zoompan `iw`/`ih` are the filter's INPUT frame (the prescaled one),
+ * so the expressions are coordinate-system-agnostic by construction. */
+export function zoomPanFilter(zoom: ZoomOptions, rampFrames: number): string {
+  const { z, x, y } = zoomExpressions(zoom.mode, zoom.factor, zoom.easing, rampFrames);
+  return (
+    (isPanMode(zoom.mode)
+      ? `scale=${zoom.srcWidth * 2}:${zoom.srcHeight * 2},`
+      : "") +
+    `zoompan=z='${z}':x='${x}':y='${y}':d=1:fps=${trimNum(zoom.srcFps)}` +
+    `:s=${zoom.srcWidth}x${zoom.srcHeight}`
+  );
 }
 
 /** One crossfade transition declaration (plan op `crossfade`). Offsets are
@@ -360,13 +457,25 @@ function buildTransitionCommand(
   ];
 
   const links: string[] = [];
+  // zoom rides per-input BEFORE the xfade links — every input uniformly (R5
+  // F2b: zoompan on only SOME inputs fails loudly, exit 234 timebase
+  // mismatch). Each input gets its own ramp N_k = max(2, round(L_k·fps)) —
+  // the per-clip Ken Burns treatment: motion re-runs its full ramp per
+  // segment and resets at each join (the fade itself carries the reset).
+  if (opts.zoom) {
+    for (let k = 0; k < n; k++) {
+      const len = segments[k]!.end - segments[k]!.start;
+      links.push(`[${k}:v]${zoomPanFilter(opts.zoom, zoomRampFrames(len, opts.zoom.srcFps))}[z${k}]`);
+    }
+  }
   for (let k = 1; k < n; k++) {
-    const left = k === 1 ? "0:v" : `v${k - 1}`;
+    const left = k === 1 ? (opts.zoom ? "z0" : "0:v") : `v${k - 1}`;
+    const right = opts.zoom ? `z${k}` : `${k}:v`;
     const last = k === n - 1;
     const chain =
       `xfade=transition=${crossfade.kind}:duration=${d}:offset=${t3(offsets[k - 1]!)}` +
       (last && videoTail.length > 0 ? `,${videoTail.join(",")}` : "");
-    links.push(`[${left}][${k}:v]${chain}[${last ? (opts.gif ? "vx" : "v") : `v${k}`}]`);
+    links.push(`[${left}][${right}]${chain}[${last ? (opts.gif ? "vx" : "v") : `v${k}`}]`);
   }
   if (opts.gif) {
     links.push(`[vx]${gifPaletteChain(opts.gif)}`);
@@ -427,6 +536,9 @@ function buildTransitionCommand(
  * `opts.gif` appends the palette graph after the composed video chain and
  * muxes to the gif muxer (`-map [v] -an`, no h264/mov flags) — the select
  * path moves into -filter_complex for it, still exactly one invocation.
+ * `opts.zoom` inserts a zoompan between `select` and the retime `setpts`
+ * (select path / gif select path) or per-input before the xfade links
+ * (chain path) — still exactly one invocation, duration frame-exact (R5).
  */
 export function buildRenderCommand(
   input: string,
@@ -447,6 +559,12 @@ export function buildRenderCommand(
   }
   const expr = selectExpression(segments);
   const speed = opts.speedFactor && opts.speedFactor !== 1 ? opts.speedFactor : undefined;
+  // one continuous ramp across the WHOLE program (R5: N = max(2,
+  // round(timelineDuration × fps)), unscaled — speed re-times AFTER zoompan;
+  // the min(·,1) clamp absorbs the inclusive-`between` +1 frame per segment)
+  const zoomLink = opts.zoom
+    ? [zoomPanFilter(opts.zoom, zoomRampFrames(totalDuration(segments), opts.zoom.srcFps))]
+    : [];
 
   if (opts.gif) {
     // render-path enforcement of the extension contract (validate also
@@ -463,6 +581,7 @@ export function buildRenderCommand(
     }
     const head = [
       `select='${expr}'`,
+      ...zoomLink,
       `setpts=N/FRAME_RATE/TB${speed ? `/${trimNum(speed)}` : ""}`,
       ...(opts.scaleWidth ? [`scale=${opts.scaleWidth}:${opts.scaleHeight ?? -2}`] : []),
       ...(opts.subtitleFile
@@ -487,6 +606,7 @@ export function buildRenderCommand(
 
   const vf = [
     `select='${expr}'`,
+    ...zoomLink,
     `setpts=N/FRAME_RATE/TB${speed ? `/${trimNum(speed)}` : ""}`,
     ...(opts.scaleWidth ? [`scale=${opts.scaleWidth}:${opts.scaleHeight ?? -2}`] : []),
     ...(opts.subtitleFile

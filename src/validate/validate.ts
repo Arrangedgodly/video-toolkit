@@ -104,7 +104,8 @@ export async function validatePlan(
       op.type === "overlay-text" ||
       op.type === "audio-mix" ||
       op.type === "crossfade" ||
-      op.type === "export-gif"
+      op.type === "export-gif" ||
+      op.type === "zoom"
     ) {
       const first = seenTransforms.get(op.type);
       if (first !== undefined) {
@@ -171,6 +172,21 @@ export async function validatePlan(
             "(the plan op does not expose expr=); pick a catalog kind via `video transitions`",
         });
       }
+      if (op.type === "zoom") {
+        // R5's constraints table: factor ≤ 1.0 is a motion no-op, > 2.0
+        // halves+ detail (zoompan crops iw/F × ih/F and upscales back);
+        // default 1.2, comfortable ≤ 1.3 — the schema keeps the value raw so
+        // this fence can say so (an OPERATION_INVALID, not a Zod rejection)
+        if (op.factor !== undefined && (!(op.factor > 1) || op.factor > 2)) {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: i + 1,
+            message:
+              `zoom: factor (${op.factor}) must be in the range 1.0 < f ≤ 2.0 ` +
+              `(no motion at ≤ 1.0; detail visibly halved toward 2.0 — default 1.2, comfortable ≤ 1.3)`,
+          });
+        }
+      }
       if (op.type === "audio-mix") {
         try {
           await stat(op.file);
@@ -225,6 +241,10 @@ export async function validatePlan(
   const exportGifOp = plan.operations.find(
     (op): op is Extract<(typeof plan.operations)[number], { type: "export-gif" }> =>
       op.type === "export-gif",
+  );
+  const zoomOp = plan.operations.find(
+    (op): op is Extract<(typeof plan.operations)[number], { type: "zoom" }> =>
+      op.type === "zoom",
   );
   if ((captionsOp || overlayTextOp) && errors.length === 0) {
     const { hasFilter } = await import("../media/ffmpeg.js");
@@ -317,6 +337,44 @@ export async function validatePlan(
         operation: opIndex,
         message: `crossfade + audio-mix in one plan is not a supported composition (the sidechain-ducking graph was never validated against the transition chain); drop one of the two`,
       });
+    }
+  }
+
+  // zoom ramp-unit fence (R5's constraints table): a motion unit shorter
+  // than 2 source frames would render exit-0-but-degenerate (a single-frame
+  // ramp). Select path: one unit = the whole timeline; crossfade path: one
+  // unit PER keep-segment (each -ss/-t input re-runs its own ramp). Visual
+  // op — NO duration law consumes it anywhere.
+  if (zoomOp && report.timeline) {
+    const fps = media.video?.fps ?? 0;
+    if (fps > 0) {
+      const opIndex = plan.operations.indexOf(zoomOp) + 1;
+      const unitFrames = (start: number, end: number) => Math.round((end - start) * fps);
+      if (crossfadeOp) {
+        for (let k = 0; k < report.timeline.length; k++) {
+          const seg = report.timeline[k]!;
+          if (unitFrames(seg.start, seg.end) < 2) {
+            errors.push({
+              code: "OPERATION_INVALID",
+              operation: opIndex,
+              message:
+                `zoom: segment ${k + 1} [${seg.start.toFixed(3)}, ${seg.end.toFixed(3)}] is shorter than ` +
+                `2 source frames at ${fps} fps — its motion ramp would be degenerate (grow the trim or drop the zoom)`,
+            });
+          }
+        }
+      } else {
+        const total = totalDuration(report.timeline);
+        if (Math.round(total * fps) < 2) {
+          errors.push({
+            code: "OPERATION_INVALID",
+            operation: opIndex,
+            message:
+              `zoom: the timeline (${total.toFixed(3)}s) is shorter than 2 source frames at ${fps} fps — ` +
+              `the motion ramp would be degenerate`,
+          });
+        }
+      }
     }
   }
 

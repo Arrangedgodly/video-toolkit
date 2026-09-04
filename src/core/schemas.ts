@@ -208,6 +208,22 @@ export const CrossfadeOp = z.object({
   kind: z.enum(CROSSFADE_KIND_OR_CUSTOM).default("fade"),
 });
 
+/** Ken Burns camera motion over the whole program (plan op `zoom`; R5's
+ * committed contract, docs/ultron/research/r5-zoom-motion.md). VISUAL-ONLY:
+ * zoom never enters any duration law. `mode` is CAMERA direction — pan
+ * `right` = the view moves right = the content drifts left. */
+export const ZoomOp = z.object({
+  type: z.literal("zoom"),
+  /** camera motion; default "in" (center-anchored zoom) */
+  mode: z.enum(["in", "out", "left", "right", "up", "down"]).default("in"),
+  /** zoom level; default 1.2 (applied by the render layer — the schema keeps
+   * the value raw so validate can emit its own OPERATION_INVALID fence for
+   * 1.0 < f ≤ 2.0 rather than a generic Zod rejection) */
+  factor: z.number().optional(),
+  /** ramp easing; default "smooth" (smoothstep 3p²−2p³, classic Ken Burns) */
+  easing: z.enum(["smooth", "linear"]).default("smooth"),
+});
+
 /** Export op — TERMINAL (must be the LAST operation; validate enforces the
  * position): changes the output FORMAT, not the content, so it is NOT a
  * TransformOpType member. First of an export-op class. Renders the compiled
@@ -237,7 +253,8 @@ export type TransformOpType =
   | "volume"
   | "captions"
   | "overlay-text"
-  | "audio-mix";
+  | "audio-mix"
+  | "zoom";
 
 export const Operation = z.discriminatedUnion("type", [
   TrimOp,
@@ -251,6 +268,7 @@ export const Operation = z.discriminatedUnion("type", [
   AudioMixOp,
   CrossfadeOp,
   ExportGifOp,
+  ZoomOp,
 ]);
 
 export const OutputSpec = z.object({
