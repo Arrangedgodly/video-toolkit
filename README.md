@@ -42,6 +42,9 @@ Default output is compact single-line JSON (token-efficient); add `--pretty` for
 ```
 video inspect <input>      structured media metadata (JSON)
 video plan <input>         scaffold a valid edit plan for the source
+video plan lint <plan>     advisory suggestions for a valid plan (the seven
+                           deterministic hygiene rules; exit 0 — an invalid
+                           plan reports validate's own contract)
 video validate <plan>      check a plan; machine-readable errors
 video preview <plan>       cheap preview render (<output>.preview.mp4)
 video render <plan>        final render from the validated plan
@@ -124,7 +127,7 @@ Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operatio
 
 1. **Observe** — `video inspect` for facts; run the workers the task needs (`detect-silence`, `detect-scenes`, `transcribe`, …). To actually *look* at the material before judging: `extract-frame --at t1,t2` for specific moments, `review-frames --scenes scenes.json` for grouped stills around every scene boundary, `generate-proxy` for a cheap watchable copy. Cached observations make re-runs free.
 2. **Plan** — turn observations into ops: scaffold with `video plan`, pre-fill via a bridge (`--cuts-from`, `--highlights-from`), then prune and tune by judgment — that part is yours.
-3. **Validate** — `video validate` until `valid: true`; branch on the error `code` to fix problems programmatically.
+3. **Validate** — `video validate` until `valid: true`; branch on the error `code` to fix problems programmatically. Then **lint** for cleanliness: `video plan lint plan.json` is an advisory pass over the *valid* plan naming redundant/mergeable/no-op operations, overlapping cuts, and sub-second keep-segments (`{suggestions: [{code, operation?, message, fix?}]}`, always exit 0 — it never mutates the plan and never changes validate's verdict; an invalid plan gets validate's own report instead).
 4. **Preview** — `video preview` writes `<output>.preview.mp4` (640w, ultrafast, CRF 30), so iterating can never clobber the final. Inspect the result with `extract-frame`/`review-frames` and loop back to the plan.
 5. **Render** — `video render`, once, when the plan is approved: one pass, final settings (CRF 18, `medium`, AAC 192k). `--force` is required to overwrite an existing output, and the source can never be an output. `--encoder libx264|h264_videotoolbox` overrides the codec choice; `video benchmark <input>` measures which is fastest on your machine. Many plans at once: `video render-batch <plans...>` renders plan files, directories (`*.json` inside), or `*` globs with bounded parallelism (`--jobs N`, default = the first plan's source benchmark concurrency recommendation) — an invalid or failing plan is reported in the per-plan results and the batch always runs to completion (exit 0 only if every plan succeeded).
 

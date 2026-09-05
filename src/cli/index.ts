@@ -7,6 +7,7 @@ import type { EncoderId } from "../media/ffmpeg.js";
 import { renderPlan } from "../render/render.js";
 import { renderBatch } from "../render/batch.js";
 import { validatePlan } from "../validate/validate.js";
+import { lintPlanFile } from "../validate/lint.js";
 import { diagnose } from "../hardware/diagnose.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
 import { catalogTransitions } from "../media/transitions.js";
@@ -29,6 +30,10 @@ usage: video <command> [args] [flags]
 commands:
   inspect <input>            structured media metadata (JSON)
   plan <input>               scaffold a valid edit plan for the source (JSON)
+  plan lint <plan>           advisory suggestions for a VALID plan (JSON; the
+                             seven deterministic rules; exit 0 always — an
+                             invalid plan reports validate's own contract,
+                             exit 1; suggestions are never auto-applied)
   validate <plan>            check a plan; machine-readable errors (JSON)
   preview <plan>             cheap preview render (<output>.preview.mp4)
   render <plan>              final render from the validated plan
@@ -254,6 +259,34 @@ async function main(): Promise<void> {
     }
     case "plan": {
       if (!input) throw new ToolError("SOURCE_NOT_FOUND", "usage: video plan <input>");
+      // T24 collision rule: the literal first positional `lint` followed by a
+      // second positional selects the lint subcommand; a lone `lint`
+      // positional is still a source path (a file genuinely named "lint"
+      // stays scaffoldable).
+      if (input === "lint" && f.positional.length > 1) {
+        const result = await lintPlanFile(f.positional[1]!, {
+          noCache: f.noCache,
+          debug: debugLine(f),
+        });
+        if (!result.valid) {
+          // an invalid plan is a validate concern — the EXISTING validate
+          // error contract, exit 1, no new codes
+          const v = result.validation;
+          emit(f, {
+            valid: false,
+            errors: v.errors,
+            warnings: v.warnings,
+            timelineDuration: v.timelineDuration,
+            ...(v.crossfadeDuration !== undefined
+              ? { crossfadeDuration: v.crossfadeDuration, expectedDuration: v.expectedDuration }
+              : {}),
+          });
+          process.exitCode = 1;
+          return;
+        }
+        emit(f, { suggestions: result.suggestions });
+        return; // exit 0 ALWAYS on a valid plan — lint never invalidates
+      }
       await scaffoldPlan(input, f);
       return;
     }

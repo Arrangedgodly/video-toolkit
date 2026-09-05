@@ -32,8 +32,8 @@ const TOOLS = [
   "video_benchmark", "video_captions", "video_detect_filler", "video_detect_scenes",
   "video_detect_silence", "video_diagnose", "video_extract_frames", "video_find_highlights",
   "video_generate_proxy", "video_inspect", "video_measure_loudness", "video_plan",
-  "video_preview", "video_render", "video_render_batch", "video_review_frames",
-  "video_transcribe", "video_transitions", "video_validate",
+  "video_plan_lint", "video_preview", "video_render", "video_render_batch",
+  "video_review_frames", "video_transcribe", "video_transitions", "video_validate",
 ];
 
 let dir = "";

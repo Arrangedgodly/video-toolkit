@@ -10,7 +10,10 @@ export interface Segment {
 const MIN_SEGMENT = 0.01;
 const TOUCH_EPSILON = 0.001;
 
-function normalize(ranges: Segment[]): Segment[] {
+/** Sort + gap-merge + drop sub-MIN_SEGMENT pieces — the trim-union
+ * semantics. Pure; exported (T24) so the lint rule engine reasons with the
+ * compiler's own math instead of restating it. */
+export function normalize(ranges: Segment[]): Segment[] {
   const sorted = [...ranges].sort((a, b) => a.start - b.start);
   const merged: Segment[] = [];
   for (const r of sorted) {
@@ -24,7 +27,10 @@ function normalize(ranges: Segment[]): Segment[] {
   return merged.filter((s) => s.end - s.start >= MIN_SEGMENT);
 }
 
-function subtract(segments: Segment[], range: Segment): Segment[] {
+/** Subtract one range from a segment list — the cut semantics (residual
+ * pieces shorter than MIN_SEGMENT are dropped, exactly as compileTimeline
+ * does). Pure; exported (T24) for the lint rule engine. */
+export function subtract(segments: Segment[], range: Segment): Segment[] {
   const out: Segment[] = [];
   for (const s of segments) {
     if (range.end <= s.start || range.start >= s.end) {

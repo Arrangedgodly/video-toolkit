@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { adjustedDuration, compileTimeline, totalDuration, xfadeOffsets } from "../core/timeline.js";
+import { adjustedDuration, compileTimeline, normalize, subtract, totalDuration, xfadeOffsets } from "../core/timeline.js";
 import type { Operation } from "../core/schemas.js";
 
 const dur = 100;
@@ -139,4 +139,45 @@ test("adjustedDuration: shrinkage never goes negative (clamped)", () => {
   // a pathological (validate-rejected) D larger than the timeline cannot
   // produce a negative expectation
   assert.equal(adjustedDuration(R3, 100), 0);
+});
+
+// ---- exported primitives (T24: the lint rule engine reuses the compiler's
+// own math; behavior identical to what compileTimeline exercises above)
+
+test("normalize: sorts, gap-merges under TOUCH_EPSILON, drops sub-MIN_SEGMENT pieces", () => {
+  assert.deepEqual(
+    normalize([{ start: 50, end: 60 }, { start: 10, end: 20 }, { start: 20, end: 30 }]),
+    [{ start: 10, end: 30 }, { start: 50, end: 60 }],
+  );
+  // gap 0.0005 < 0.001 epsilon: merged
+  assert.deepEqual(normalize([{ start: 0, end: 10 }, { start: 10.0005, end: 20 }]), [
+    { start: 0, end: 20 },
+  ]);
+  // gap 0.005 > epsilon: kept apart (the MERGEABLE_TRIMS lint band)
+  assert.deepEqual(normalize([{ start: 0, end: 10 }, { start: 10.005, end: 20 }]), [
+    { start: 0, end: 10 },
+    { start: 10.005, end: 20 },
+  ]);
+  // a residual sliver shorter than MIN_SEGMENT (0.01) is dropped
+  assert.deepEqual(normalize([{ start: 0, end: 0.005 }]), []);
+});
+
+test("subtract: pure range removal, boundary-touching is a no-op, slivers drop", () => {
+  // interior split
+  assert.deepEqual(subtract([{ start: 0, end: 30 }], { start: 10, end: 15 }), [
+    { start: 0, end: 10 },
+    { start: 15, end: 30 },
+  ]);
+  // touching a boundary changes nothing (range.start >= s.end)
+  assert.deepEqual(subtract([{ start: 0, end: 10 }], { start: 10, end: 20 }), [
+    { start: 0, end: 10 },
+  ]);
+  // a cut leaving a sub-MIN_SEGMENT residual drops that residual entirely
+  assert.deepEqual(subtract([{ start: 0, end: 30 }], { start: 0, end: 29.995 }), []);
+  // a residual of exactly MIN_SEGMENT (0.01) survives
+  assert.deepEqual(subtract([{ start: 0, end: 30 }], { start: 0, end: 29.99 }), [
+    { start: 29.99, end: 30 },
+  ]);
+  // full cover: everything removed (compileTimeline turns this into EMPTY_TIMELINE)
+  assert.deepEqual(subtract([{ start: 0, end: 30 }], { start: 0, end: 30 }), []);
 });

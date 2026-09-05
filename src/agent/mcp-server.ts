@@ -6,6 +6,7 @@ import type { EncoderId } from "../media/ffmpeg.js";
 import { cachedInspect } from "../cache/cache.js";
 import { scaffoldPlanObject } from "../core/scaffold.js";
 import { validatePlan } from "../validate/validate.js";
+import { lintPlanFile } from "../validate/lint.js";
 import { renderPlan } from "../render/render.js";
 import { renderBatch } from "../render/batch.js";
 import { diagnose } from "../hardware/diagnose.js";
@@ -114,6 +115,12 @@ const TOOLS: ToolDef[] = [
   {
     name: "video_validate",
     description: "Validate an edit plan; returns machine-readable errors with stable codes.",
+    inputSchema: { type: "object", properties: { plan: str }, required: ["plan"] },
+  },
+  {
+    name: "video_plan_lint",
+    description:
+      "Advisory lint of a VALID plan (the judgment layer between validate and preview): deterministic suggestions over the compiled timeline — REDUNDANT_TRIM, REDUNDANT_CUT, MERGEABLE_TRIMS (gap ≤ 0.01 s), NOOP_VOLUME, NOOP_CUT (< 0.01 s of kept time), OVERLAPPING_CUTS, SUBSECOND_SEGMENT (< 0.5 s). Workers propose, agents decide: suggestions are never auto-applied, fix is advisory text, and lint never changes validate's verdict (exit 0 always). An invalid plan returns validate's own report (valid:false, existing codes).",
     inputSchema: { type: "object", properties: { plan: str }, required: ["plan"] },
   },
   {
@@ -333,6 +340,26 @@ async function callTool(
           ? { crossfadeDuration: r.crossfadeDuration, expectedDuration: r.expectedDuration }
           : {}),
       };
+    }
+    case "video_plan_lint": {
+      // payload = CLI stdout shape: {suggestions:[…]} on a valid plan; on an
+      // invalid plan the EXISTING validate report (a normal result, exactly
+      // video_validate's shape for the same input — exit-code semantics are
+      // the CLI's)
+      const r = await lintPlanFile(String(a.plan));
+      if (!r.valid) {
+        const v = r.validation;
+        return {
+          valid: false,
+          errors: v.errors,
+          warnings: v.warnings,
+          timelineDuration: v.timelineDuration,
+          ...(v.crossfadeDuration !== undefined
+            ? { crossfadeDuration: v.crossfadeDuration, expectedDuration: v.expectedDuration }
+            : {}),
+        };
+      }
+      return { suggestions: r.suggestions };
     }
     case "video_preview":
       // progress sink threaded through (R6): raw events only — the transport
