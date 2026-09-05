@@ -13,6 +13,10 @@ import { createProgressSink, isLoopbackHost } from "../agent/mcp-http.js";
 // T20 — progress-over-SSE (R6's committed checklist): throttled strictly-
 // increasing notifications/progress on token-carrying tools/call, closed by
 // the plain-path-identical final response frame; every other shape unchanged.
+// T23 — batch progress over the same sink: a token-carrying
+// video_render_batch on a real multi-plan batch streams the AGGREGATED
+// overall ((Σ per-plan fractions)/N × 100) and closes with the unchanged
+// BatchReport; no-token/stdio stay on their byte-identical paths.
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
 /** T20 SSE fixtures: 20 s 720p — a final render runs ≥ ~2 s wall here, long
@@ -176,6 +180,24 @@ before(async () => {
     });
   await writeFile(SSE_PLAN, plan("sse-out.mp4"));
   await writeFile(SSE_PLAN_B, plan("sse-out-b.mp4"));
+
+  // T23 SSE batch fixtures: 3 whole-source PREVIEW plans off the 20 s source
+  // (previews are real renders with progress parses, cheap at 640 w) — a
+  // multi-plan batch whose aggregate spans the throttle gates.
+  const batchPlan = (out: string): string =>
+    JSON.stringify({
+      version: 1,
+      source: SSE_FIXTURE,
+      operations: [{ type: "trim", start: 0, end: 20 }],
+      output: { path: out, mode: "preview" },
+    });
+  for (const [name, out] of [
+    ["batch-a.json", "batch-a.mp4"],
+    ["batch-b.json", "batch-b.mp4"],
+    ["batch-c.json", "batch-c.mp4"],
+  ] as const) {
+    await writeFile(name, batchPlan(out));
+  }
 
   const main = await startServe(["--port", "0"]); // OS-assigned ephemeral port
   serve = main.proc;
@@ -808,4 +830,107 @@ test("stdio: a token-carrying tools/call emits exactly one response line — nev
   const parsed = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
   assert.equal(parsed.id, 21);
   JSON.parse(parsed.result.content[0]!.text);
+});
+
+// ---- T23: batch progress over the SSE sink (R6's named future sink-firing) ----
+
+/** delete every `wallMs` key at any depth — the only field allowed to differ
+ * between two runs of the same batch (summary + per-render wall clocks). */
+function stripWallMsDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stripWallMsDeep);
+  if (v !== null && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (k === "wallMs") continue;
+      out[k] = stripWallMsDeep(val);
+    }
+    return out;
+  }
+  return v;
+}
+
+test("SSE: token-carrying tools/call video_render_batch streams monotonic OVERALL progress on a real multi-plan batch", async () => {
+  const plans = ["batch-a.json", "batch-b.json", "batch-c.json"];
+
+  // no-token degradation lock FIRST: the plain path renders the batch and is
+  // the byte-identity baseline — plain application/json, explicit length
+  const plain = await post(
+    serveBase,
+    rpc("tools/call", { name: "video_render_batch", arguments: { plans, jobs: 3 } }),
+  );
+  assert.equal(plain.status, 200);
+  assert.ok(plain.headers.get("content-type")!.startsWith("application/json"));
+  assert.ok(plain.headers.get("content-length"));
+  const plainPayload = JSON.parse(
+    ((await jsonBody(plain)).result as { content: { text: string }[] }).content[0]!.text,
+  ) as Record<string, unknown>;
+
+  // streamed: same batch, token attached, force (the plain run owns the outputs)
+  const res = await post(
+    serveBase,
+    rpc("tools/call", {
+      name: "video_render_batch",
+      arguments: { plans, jobs: 3, force: true },
+      _meta: { progressToken: "batch-tok" },
+    }),
+  );
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get("content-type")!.startsWith("text/event-stream"));
+  assert.equal(res.headers.get("content-length"), null); // chunked, self-delimiting
+
+  const frames = parseSse(await res.text());
+  const progress = frames
+    .slice(0, -1)
+    .map((f) => JSON.parse(f.data) as { method: string; params: ProgressParams });
+  const finalFrame = JSON.parse(frames[frames.length - 1]!.data) as {
+    id: number;
+    result: { content: { text: string }[] };
+  };
+
+  // ≥2 strictly-increasing overall frames with total:100, token verbatim —
+  // the sink's dual gate (≥250 ms AND ≥1.0 point) applied to the AGGREGATE
+  assert.ok(progress.length >= 2, `expected >=2 overall progress frames, got ${progress.length}`);
+  let prev = -Infinity;
+  for (const n of progress) {
+    assert.equal(n.method, "notifications/progress");
+    assert.equal(n.params.progressToken, "batch-tok");
+    assert.equal(n.params.total, 100);
+    assert.ok(n.params.progress >= 0 && n.params.progress <= 100, "overall stays in the 0-100 total domain");
+    assert.ok(n.params.progress > prev, `overall must strictly increase: ${n.params.progress} after ${prev}`);
+    assert.ok(typeof n.params.message === "string" && n.params.message.length > 0);
+    prev = n.params.progress;
+  }
+
+  // the final frame IS the unchanged BatchReport — byte-identical to the
+  // plain path modulo the inherently variable wallMs (summary + per-render)
+  const ssePayload = JSON.parse(finalFrame.result.content[0]!.text) as Record<string, unknown>;
+  assert.deepEqual(stripWallMsDeep(ssePayload), stripWallMsDeep(plainPayload));
+  const report = ssePayload as unknown as { summary: { rendered: number; failed: number; jobs: number } };
+  assert.equal(report.summary.rendered, 3);
+  assert.equal(report.summary.failed, 0);
+  assert.equal(report.summary.jobs, 3);
+});
+
+test("stdio: token-carrying tools/call video_render_batch emits exactly one response line — never a notification", async () => {
+  const lines = await stdioExchange(
+    [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: {
+          name: "video_render_batch",
+          arguments: { plans: ["batch-a.json"], jobs: 1, force: true },
+          _meta: { progressToken: "stdio-batch" },
+        },
+      }),
+    ],
+    1,
+  );
+  assert.equal(lines.length, 1); // stdio passes no sink — no aggregation, no notifications
+  assert.ok(!lines[0]!.includes("notifications/progress"));
+  const parsed = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
+  assert.equal(parsed.id, 22);
+  const report = JSON.parse(parsed.result.content[0]!.text) as { summary: { rendered: number } };
+  assert.equal(report.summary.rendered, 1);
 });

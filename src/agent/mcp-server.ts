@@ -65,13 +65,15 @@ export interface DispatchOptions {
    * else answer 2025-06-18 (the revision the server targets). Stdio keeps
    * its historical behavior: echo whatever was sent, else 2024-11-05. */
   negotiateProtocolVersion?: boolean;
-  /** Raw engine progress events for the long tools (video_render /
-   * video_preview), forwarded verbatim from renderPlan's existing onProgress
-   * hook (fed by the ffmpeg progress parse). Only a streaming transport
-   * passes one; stdio never does, so its stdout stays byte-identical —
-   * notifications surface ONLY through this callback and the return contract
-   * below is unchanged. Throttling + monotonicity are transport policy
-   * (R6: the sink lives in src/agent/mcp-http.ts). */
+  /** Raw progress events for the long tools — video_render / video_preview
+   * forward renderPlan's existing onProgress hook verbatim (fed by the ffmpeg
+   * progress parse); video_render_batch forwards the AGGREGATED overall
+   * ((Σ per-plan fractions)/N × 100, per src/render/batch.ts — T23, R6's
+   * named future sink-firing). Only a streaming transport passes one; stdio
+   * never does, so its stdout stays byte-identical — notifications surface
+   * ONLY through this callback and the return contract below is unchanged.
+   * Throttling + monotonicity are transport policy (R6: the sink lives in
+   * src/agent/mcp-http.ts). */
   onProgress?: (p: { percent: number | null; timeSec: number }) => void;
 }
 
@@ -348,6 +350,10 @@ async function callTool(
         {
           jobs: a.jobs as number | undefined,
           force: a.force === true,
+          // (T23) overall-batch progress (R6's named future sink-firing):
+          // raw aggregate events — the transport sink owns throttle/
+          // monotonicity; absent (stdio) = no notifications, byte-identical
+          onProgress,
         },
       );
     case "video_detect_silence":

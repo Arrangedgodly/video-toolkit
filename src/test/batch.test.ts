@@ -8,12 +8,21 @@ import { runCapture } from "../media/ffprobe.js";
 import { Cache } from "../cache/cache.js";
 import { ffmpegVersion } from "../media/ffmpeg.js";
 import { ToolError } from "../core/errors.js";
-import { expandPlanArgs, renderBatch, type BatchReport } from "../render/batch.js";
+import {
+  createBatchProgressAggregator,
+  expandPlanArgs,
+  renderBatch,
+  type BatchProgressEvent,
+  type BatchReport,
+} from "../render/batch.js";
 
 // T22 — `render-batch`: expansion determinism, jobs derivation, per-plan
 // failure capture under mapBounded, CLI exit codes, MCP parity. Plans use
 // preview output mode (renders land on <out>.preview.mp4, ultrafast) on tiny
 // fixtures so the suite stays fast.
+// T23 — overall-batch progress aggregation: the pure per-index fraction
+// aggregator (fake plans/fractions, no renders) + the renderBatch-level
+// no-sink no-op lock.
 
 const FIXTURE = "batch-fx.mp4"; // 4s, 320x180, 440Hz tone
 const FIXTURE2 = "batch-fx2.mp4"; // 1s, 320x180 — a SECOND source (first-plan
@@ -238,6 +247,141 @@ test("render-batch: jobs default = FIRST plan's source cached benchmark renderCo
   assert.equal(r.summary.jobs, 1);
   assert.equal(r.summary.failed, 1);
   assert.equal(r.summary.failures[0]!.code, "PLAN_INVALID_JSON");
+});
+
+// --------------------------------------------- T23: overall progress aggregation
+
+const round3 = (v: number): number => Math.round(v * 1000) / 1000;
+
+test("aggregator: overall = (Σ per-plan fractions)/N × 100 with out-of-order completion (parallel interleaving)", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(3, (p) => out.push(p));
+  agg.planEvent(1, { percent: 30, timeSec: 1 }); // (0 + .3 + 0)/3 → 10
+  agg.planEvent(2, { percent: 60, timeSec: 2 }); // (0 + .3 + .6)/3 → 30
+  agg.planComplete(2); // plan 2 finishes FIRST (out of order) → 43.333…
+  agg.planEvent(0, { percent: 50, timeSec: 0.5 }); // → 60
+  agg.planEvent(1, { percent: 90, timeSec: 3 }); // → 80
+  agg.planComplete(0); // → 96.666…
+  agg.planComplete(1); // the LAST completion drives overall to EXACTLY 100
+  assert.deepEqual(
+    out.map((p) => round3(p.percent)),
+    [10, 30, 43.333, 60, 80, 96.667, 100],
+  );
+  // timeSec = the TRIGGERING plan's own engine time (sink message names it)
+  assert.deepEqual(out.map((p) => p.timeSec), [1, 2, 2, 0.5, 3, 0.5, 3]);
+});
+
+test("aggregator: completion LOCKS at fraction 1 — success or captured failure, even having never rendered", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(2, (p) => out.push(p));
+  agg.planComplete(0); // e.g. PLAN_INVALID_JSON — no engine event ever, still finished
+  agg.planEvent(1, { percent: 40, timeSec: 5 }); // in-flight plan fails right after…
+  agg.planComplete(1); // …and still locks at 1 (a finished plan is finished)
+  assert.deepEqual(
+    out.map((p) => round3(p.percent)),
+    [50, 70, 100],
+  );
+  assert.deepEqual(out.map((p) => p.timeSec), [0, 5, 5]); // never-rendered plan carries its 0 default
+});
+
+test("aggregator: percent === null engine events are skipped (R6) — no emit, no fraction change", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(2, (p) => out.push(p));
+  agg.planEvent(0, { percent: null, timeSec: 1 }); // skipped
+  agg.planEvent(0, { percent: 25, timeSec: 2 }); // accepted → 12.5
+  agg.planEvent(0, { percent: null, timeSec: 3 }); // skipped again
+  agg.planComplete(1);
+  assert.deepEqual(
+    out.map((p) => round3(p.percent)),
+    [12.5, 62.5],
+  ); // the null events contributed nothing: (0.25 + 1)/2 = 62.5
+});
+
+test("aggregator: single-plan batch degrades to exactly video_render's raw stream (parity)", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(1, (p) => out.push(p));
+  const stream = [
+    { percent: 0.9, timeSec: 0.2 },
+    { percent: 2.0, timeSec: 0.4 },
+    { percent: 50, timeSec: 10 },
+    { percent: 51, timeSec: 10.2 },
+    { percent: 100, timeSec: 20 },
+  ];
+  for (const e of stream) agg.planEvent(0, e);
+  // exact passthrough: fraction = percent/100, so overall = percent (the ×100
+  // round-trip can leave a 1-ulp float artifact — compared at 1e-6)
+  const r6 = (v: number): number => Math.round(v * 1e6) / 1e6;
+  assert.deepEqual(
+    out.map((p) => r6(p.percent)),
+    stream.map((e) => r6(e.percent)),
+  );
+  assert.deepEqual(out.map((p) => p.timeSec), stream.map((e) => e.timeSec));
+  agg.planComplete(0); // natural terminal event at the SAME 100 — a sink's
+  // ≥1.0-point gate suppresses it (Δ = 0), so video_render parity holds end
+  // to end; no synthetic final event is invented
+  assert.deepEqual(
+    out.map((p) => r6(p.percent)),
+    [...stream.map((e) => r6(e.percent)), 100],
+  );
+  // defensive clamp: the fraction can never exceed 1 (overall ≤ total:100)
+  const clamped: BatchProgressEvent[] = [];
+  createBatchProgressAggregator(2, (p) => clamped.push(p)).planEvent(0, {
+    percent: 150,
+    timeSec: 1,
+  });
+  assert.equal(round3(clamped[0]!.percent), 50); // 1.0 + 0 contributions / 2, never 75
+});
+
+test("aggregator: deterministic — the same synthetic streams yield the same overall sequence", () => {
+  const feed = (agg: ReturnType<typeof createBatchProgressAggregator>): void => {
+    agg.planEvent(0, { percent: 10, timeSec: 1 });
+    agg.planEvent(3, { percent: 33, timeSec: 2 });
+    agg.planEvent(1, { percent: null, timeSec: 9 });
+    agg.planComplete(3);
+    agg.planEvent(2, { percent: 99.5, timeSec: 3 });
+    agg.planComplete(0);
+    agg.planComplete(2);
+    agg.planEvent(1, { percent: 20, timeSec: 4 });
+    agg.planComplete(1);
+  };
+  const a: BatchProgressEvent[] = [];
+  const b: BatchProgressEvent[] = [];
+  feed(createBatchProgressAggregator(4, (p) => a.push(p)));
+  feed(createBatchProgressAggregator(4, (p) => b.push(p)));
+  assert.deepEqual(a, b);
+  assert.equal(a[a.length - 1]!.percent, 100); // ends at exactly 100, no clock involved
+});
+
+function stripWallMs(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(stripWallMs);
+  if (v !== null && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (k === "wallMs") continue;
+      out[k] = stripWallMs(val);
+    }
+    return out;
+  }
+  return v;
+}
+
+test("render-batch: onProgress is a pure addition — sink vs no-sink BatchReports identical (modulo wallMs), CLI/stdio keep the no-sink path", async () => {
+  const p1 = await writePlan("np1.json", plan(FIXTURE, [{ type: "trim", start: 0, end: 0.4 }], "np1.mp4"));
+  const p2 = await writePlan("np2.json", plan(FIXTURE, [{ type: "trim", start: 0.4, end: 0.8 }], "np2.mp4"));
+  const events: BatchProgressEvent[] = [];
+  const withSink = await renderBatch([p1, p2], { jobs: 1, force: true, onProgress: (p) => events.push(p as BatchProgressEvent) });
+  const withoutSink = await renderBatch([p1, p2], { jobs: 1, force: true });
+  assert.equal(withSink.summary.rendered, 2);
+  assert.deepEqual(stripWallMs(withSink), stripWallMs(withoutSink));
+
+  // the raw overall stream: percent always within the 0–100 total domain and
+  // the LAST event exactly 100 (the final completion — no synthetic event;
+  // ≥2 is structural: each plan completion forwards, and there are 2 plans);
+  // values are RAW (a within-plan engine regression may dip them — the
+  // transport sink's monotonic gate is the fence, not the aggregator's)
+  assert.ok(events.length >= 2, `expected >=2 raw overall events, got ${events.length}`);
+  for (const e of events) assert.ok(e.percent >= 0 && e.percent <= 100);
+  assert.equal(round3(events[events.length - 1]!.percent), 100);
 });
 
 // --------------------------------------------------------- CLI exit codes

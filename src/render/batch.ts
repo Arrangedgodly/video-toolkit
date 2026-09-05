@@ -54,6 +54,74 @@ export interface RenderBatchOpts extends RenderOpts {
   jobs?: number;
   /** per-plan progress hook (the CLI writes `[i/N] <file>` lines to stderr) */
   onPlanStart?: (index: number, total: number, plan: string) => void;
+  /** (T23) OVERALL-batch progress, overriding the inherited per-render
+   * meaning: renderBatch never forwards this to renderPlan verbatim — each
+   * render's engine events feed `createBatchProgressAggregator` and this
+   * receives the raw overall = (Σ per-plan fractions)/N × 100 on every
+   * accepted per-plan event and every plan completion (a finished plan —
+   * success OR captured failure — locks its fraction at 1; not-yet-started
+   * plans hold 0). Never called with `percent: null` (the aggregate is
+   * always known); values are RAW — the consumer's sink owns throttling and
+   * monotonicity (R6: policy is a transport concern, exactly as for
+   * `video_render`). Absent (CLI, stdio) = the aggregation no-ops entirely. */
+  onProgress?: (p: { percent: number | null; timeSec: number }) => void;
+}
+
+/** (T23) one aggregated overall-batch progress event: `percent` = (Σ per-plan
+ * fractions)/N × 100 (finite by construction), `timeSec` = the triggering
+ * plan's own engine time (its last known value on completion) so a consumer's
+ * message names the in-flight render. */
+export interface BatchProgressEvent {
+  percent: number;
+  timeSec: number;
+}
+
+export interface BatchProgressAggregator {
+  /** feed one RAW per-plan engine event (`percent: null` skipped — R6) */
+  planEvent: (index: number, p: { percent: number | null; timeSec: number }) => void;
+  /** plan `index` finished (success OR captured failure) — fraction locks at 1 */
+  planComplete: (index: number) => void;
+}
+
+/** Pure overall-batch progress aggregator (T23): combines the per-plan
+ * onProgress streams of parallel renders into ONE 0–100 value. Deterministic
+ * by construction — no clock, no randomness: the same event sequence yields
+ * the same overall sequence (unit-locked). The raw overall is forwarded on
+ * every accepted event INCLUDING possible regressions (a slow plan's engine
+ * percent can dip mid-run); the transport sink's monotonic gate is the
+ * guaranteed fence, exactly as for `video_render` (the plan entry's recorded
+ * division of labor). `totalPlans ≥ 1` is guaranteed by renderBatch (an empty
+ * expansion fails OPERATION_INVALID before an aggregator exists); the `max`
+ * keeps the pure function safe for direct unit use. A single-plan batch
+ * degrades to exactly `video_render`'s raw stream (fraction = percent/100,
+ * so overall = percent; the engine parse already clamps to ≤ 100 — the
+ * fraction clamp is the defensive mirror). No synthetic final-100 event:
+ * when the last plan completes the overall IS exactly 100, forwarded through
+ * the consumer's normal gates (the response frame is completion). */
+export function createBatchProgressAggregator(
+  totalPlans: number,
+  emit: (p: BatchProgressEvent) => void,
+): BatchProgressAggregator {
+  const n = Math.max(1, Math.floor(totalPlans));
+  const fractions = new Array<number>(n).fill(0);
+  const lastTimeSec = new Array<number>(n).fill(0);
+  const forward = (index: number): void => {
+    let sum = 0;
+    for (const f of fractions) sum += f;
+    emit({ percent: (sum / n) * 100, timeSec: lastTimeSec[index]! });
+  };
+  return {
+    planEvent: (index, p) => {
+      if (p.percent === null || !Number.isFinite(p.percent)) return; // R6 skip
+      lastTimeSec[index] = p.timeSec;
+      fractions[index] = Math.min(1, Math.max(0, p.percent / 100));
+      forward(index);
+    },
+    planComplete: (index) => {
+      fractions[index] = 1;
+      forward(index);
+    },
+  };
 }
 
 function hasWildcard(p: string): boolean {
@@ -168,6 +236,11 @@ export async function renderBatch(args: string[], opts: RenderBatchOpts = {}): P
   const jobs = opts.jobs ?? (await defaultJobs(plans[0]!));
   const debug = opts.debug ?? (() => {});
   debug(`render-batch: ${plans.length} plan(s), jobs=${jobs}`);
+  // (T23) overall-batch progress — constructed only when a sink is attached,
+  // so the CLI/stdio paths take the identical no-aggregator code path.
+  const aggregator = opts.onProgress
+    ? createBatchProgressAggregator(plans.length, opts.onProgress)
+    : undefined;
 
   // Every item is wrapped so a validation/render failure is CAPTURED per
   // plan — mapBounded's lowest-index-throw semantics never engage; the batch
@@ -184,10 +257,14 @@ export async function renderBatch(args: string[], opts: RenderBatchOpts = {}): P
           encoder: opts.encoder,
           noCache: opts.noCache,
           debug: opts.debug,
+          onProgress: aggregator ? (p) => aggregator.planEvent(i, p) : undefined,
         });
         return { plan, ok: true, output: result.output, result };
       } catch (e) {
         return { plan, ok: false, error: toBatchError(e) };
+      } finally {
+        // finished is finished — success or captured failure locks at 1
+        aggregator?.planComplete(i);
       }
     },
   );
