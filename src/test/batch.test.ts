@@ -23,6 +23,9 @@ import {
 // T23 — overall-batch progress aggregation: the pure per-index fraction
 // aggregator (fake plans/fractions, no renders) + the renderBatch-level
 // no-sink no-op lock.
+// T26 — the formatted per-plan `message` on every aggregate event: FIXED
+// template `plan i/N (basename): P% — overall O%` (basename display name,
+// completion → 100, Math.round integers, single-plan shape, determinism).
 
 const FIXTURE = "batch-fx.mp4"; // 4s, 320x180, 440Hz tone
 const FIXTURE2 = "batch-fx2.mp4"; // 1s, 320x180 — a SECOND source (first-plan
@@ -255,7 +258,10 @@ const round3 = (v: number): number => Math.round(v * 1000) / 1000;
 
 test("aggregator: overall = (Σ per-plan fractions)/N × 100 with out-of-order completion (parallel interleaving)", () => {
   const out: BatchProgressEvent[] = [];
-  const agg = createBatchProgressAggregator(3, (p) => out.push(p));
+  const agg = createBatchProgressAggregator(
+    ["plans/alpha.json", "plans/beta.json", "plans/gamma.json"],
+    (p) => out.push(p),
+  );
   agg.planEvent(1, { percent: 30, timeSec: 1 }); // (0 + .3 + 0)/3 → 10
   agg.planEvent(2, { percent: 60, timeSec: 2 }); // (0 + .3 + .6)/3 → 30
   agg.planComplete(2); // plan 2 finishes FIRST (out of order) → 43.333…
@@ -273,7 +279,7 @@ test("aggregator: overall = (Σ per-plan fractions)/N × 100 with out-of-order c
 
 test("aggregator: completion LOCKS at fraction 1 — success or captured failure, even having never rendered", () => {
   const out: BatchProgressEvent[] = [];
-  const agg = createBatchProgressAggregator(2, (p) => out.push(p));
+  const agg = createBatchProgressAggregator(["d/a.json", "d/b.json"], (p) => out.push(p));
   agg.planComplete(0); // e.g. PLAN_INVALID_JSON — no engine event ever, still finished
   agg.planEvent(1, { percent: 40, timeSec: 5 }); // in-flight plan fails right after…
   agg.planComplete(1); // …and still locks at 1 (a finished plan is finished)
@@ -286,7 +292,7 @@ test("aggregator: completion LOCKS at fraction 1 — success or captured failure
 
 test("aggregator: percent === null engine events are skipped (R6) — no emit, no fraction change", () => {
   const out: BatchProgressEvent[] = [];
-  const agg = createBatchProgressAggregator(2, (p) => out.push(p));
+  const agg = createBatchProgressAggregator(["n1.json", "n2.json"], (p) => out.push(p));
   agg.planEvent(0, { percent: null, timeSec: 1 }); // skipped
   agg.planEvent(0, { percent: 25, timeSec: 2 }); // accepted → 12.5
   agg.planEvent(0, { percent: null, timeSec: 3 }); // skipped again
@@ -299,7 +305,7 @@ test("aggregator: percent === null engine events are skipped (R6) — no emit, n
 
 test("aggregator: single-plan batch degrades to exactly video_render's raw stream (parity)", () => {
   const out: BatchProgressEvent[] = [];
-  const agg = createBatchProgressAggregator(1, (p) => out.push(p));
+  const agg = createBatchProgressAggregator(["solo.json"], (p) => out.push(p));
   const stream = [
     { percent: 0.9, timeSec: 0.2 },
     { percent: 2.0, timeSec: 0.4 },
@@ -325,7 +331,7 @@ test("aggregator: single-plan batch degrades to exactly video_render's raw strea
   );
   // defensive clamp: the fraction can never exceed 1 (overall ≤ total:100)
   const clamped: BatchProgressEvent[] = [];
-  createBatchProgressAggregator(2, (p) => clamped.push(p)).planEvent(0, {
+  createBatchProgressAggregator(["c1.json", "c2.json"], (p) => clamped.push(p)).planEvent(0, {
     percent: 150,
     timeSec: 1,
   });
@@ -346,10 +352,68 @@ test("aggregator: deterministic — the same synthetic streams yield the same ov
   };
   const a: BatchProgressEvent[] = [];
   const b: BatchProgressEvent[] = [];
-  feed(createBatchProgressAggregator(4, (p) => a.push(p)));
-  feed(createBatchProgressAggregator(4, (p) => b.push(p)));
+  feed(createBatchProgressAggregator(["f1.json", "f2.json", "f3.json", "f4.json"], (p) => a.push(p)));
+  feed(createBatchProgressAggregator(["f1.json", "f2.json", "f3.json", "f4.json"], (p) => b.push(p)));
   assert.deepEqual(a, b);
   assert.equal(a[a.length - 1]!.percent, 100); // ends at exactly 100, no clock involved
+});
+
+// --------------------------------------------- T26: the formatted message field
+
+test("message: FIXED template `plan i/N (basename): P% — overall O%` — mid-flight, completion → 100, basename, rounding", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(
+    ["plans/alpha.json", "plans/beta.json", "plans/gamma.json"],
+    (p) => out.push(p),
+  );
+  agg.planEvent(1, { percent: 33.4, timeSec: 2 }); // 0-based idx 1 → plan 2/3; 33.4 → 33; overall 11.13… → 11
+  agg.planComplete(2); // completion: P LOCKED at 100; overall (0.334+1)/3 → 44.47 → 44
+  agg.planEvent(1, { percent: 90, timeSec: 3 }); // → 63.33 → 63
+  agg.planComplete(0); // → 96.67 → 97 (round UP branch)
+  agg.planComplete(1); // the LAST completion: overall exactly 100
+  assert.deepEqual(out.map((p) => p.message), [
+    "plan 2/3 (beta.json): 33% — overall 11%",
+    "plan 3/3 (gamma.json): 100% — overall 44%",
+    "plan 2/3 (beta.json): 90% — overall 63%",
+    "plan 1/3 (alpha.json): 100% — overall 97%",
+    "plan 2/3 (beta.json): 100% — overall 100%",
+  ]);
+});
+
+test("message: single-plan batch keeps the template (i/N = 1/1, overall ≡ planPct, half-up rounding)", () => {
+  const out: BatchProgressEvent[] = [];
+  const agg = createBatchProgressAggregator(["solo/only-one.json"], (p) => out.push(p));
+  agg.planEvent(0, { percent: 45.5, timeSec: 1 }); // Math.round(45.5) = 46 — the half branch
+  agg.planComplete(0);
+  assert.deepEqual(out.map((p) => p.message), [
+    "plan 1/1 (only-one.json): 46% — overall 46%",
+    "plan 1/1 (only-one.json): 100% — overall 100%",
+  ]);
+});
+
+test("message: a never-rendered plan's completion still reads its OWN 100 (failure locks at 1)", () => {
+  const out: BatchProgressEvent[] = [];
+  createBatchProgressAggregator(["d/a.json", "d/b.json"], (p) => out.push(p)).planComplete(0);
+  assert.deepEqual(out.map((p) => p.message), ["plan 1/2 (a.json): 100% — overall 50%"]);
+});
+
+test("message: deterministic — the same synthetic sequence yields byte-identical messages", () => {
+  const feed = (agg: ReturnType<typeof createBatchProgressAggregator>): void => {
+    agg.planEvent(0, { percent: 10.4, timeSec: 1 });
+    agg.planEvent(2, { percent: 33, timeSec: 2 });
+    agg.planComplete(2);
+    agg.planEvent(1, { percent: null, timeSec: 9 });
+    agg.planComplete(0);
+    agg.planEvent(1, { percent: 99.6, timeSec: 3 }); // 99.6 → 100 by rounding, fraction stays 0.996
+    agg.planComplete(1);
+  };
+  const a: BatchProgressEvent[] = [];
+  const b: BatchProgressEvent[] = [];
+  feed(createBatchProgressAggregator(["p/q1.json", "q2.json", "r/q3.json"], (p) => a.push(p)));
+  feed(createBatchProgressAggregator(["p/q1.json", "q2.json", "r/q3.json"], (p) => b.push(p)));
+  assert.deepEqual(a, b); // FULL events — percent AND message byte-identical
+  for (const e of a) assert.match(e.message, /^plan [1-3]\/3 \((q1|q2|q3)\.json\): \d+% — overall \d+%$/);
+  assert.equal(a[a.length - 1]!.message, "plan 2/3 (q2.json): 100% — overall 100%");
 });
 
 function stripWallMs(v: unknown): unknown {
@@ -382,6 +446,16 @@ test("render-batch: onProgress is a pure addition — sink vs no-sink BatchRepor
   assert.ok(events.length >= 2, `expected >=2 raw overall events, got ${events.length}`);
   for (const e of events) assert.ok(e.percent >= 0 && e.percent <= 100);
   assert.equal(round3(events[events.length - 1]!.percent), 100);
+
+  // (T26) real renders through the aggregator: every event's message is the
+  // FIXED template naming the in-flight plan by BASENAME; jobs=1 runs plan 1
+  // to completion before plan 2, so the terminal message is deterministic
+  for (const e of events) {
+    const m = /^plan ([12])\/2 \((np1|np2)\.json\): (\d+)% — overall (\d+)%$/.exec(e.message);
+    assert.ok(m, `message not in template: ${JSON.stringify(e.message)}`);
+    assert.ok(Number(m[3]) <= 100 && Number(m[4]) <= 100);
+  }
+  assert.equal(events[events.length - 1]!.message, "plan 2/2 (np2.json): 100% — overall 100%");
 });
 
 // --------------------------------------------------------- CLI exit codes

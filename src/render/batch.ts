@@ -63,17 +63,27 @@ export interface RenderBatchOpts extends RenderOpts {
    * plans hold 0). Never called with `percent: null` (the aggregate is
    * always known); values are RAW — the consumer's sink owns throttling and
    * monotonicity (R6: policy is a transport concern, exactly as for
-   * `video_render`). Absent (CLI, stdio) = the aggregation no-ops entirely. */
+   * `video_render`). Each event also carries the formatted T26 `message`
+   * naming the in-flight plan (see `BatchProgressEvent`); absent (CLI,
+   * stdio) = the aggregation no-ops entirely. */
   onProgress?: (p: { percent: number | null; timeSec: number }) => void;
 }
 
 /** (T23) one aggregated overall-batch progress event: `percent` = (Σ per-plan
  * fractions)/N × 100 (finite by construction), `timeSec` = the triggering
  * plan's own engine time (its last known value on completion) so a consumer's
- * message names the in-flight render. */
+ * message names the in-flight render. (T26) `message` = the FIXED display
+ * template `plan i/N (<basename>): P% — overall O%` — `i` the triggering
+ * plan's 1-based index in the EXPANDED plan order, `<basename>` =
+ * `path.basename(planPath)` (the CLI stderr precedent), `P` the triggering
+ * plan's OWN current percent as a Math.round integer (its fraction — locked
+ * at 1 → `100` on a completion event), `O` the overall aggregate as a
+ * Math.round integer. Deterministic by construction: same inputs → same
+ * string; `timeSec` stays for consumers that don't read `message`. */
 export interface BatchProgressEvent {
   percent: number;
   timeSec: number;
+  message: string;
 }
 
 export interface BatchProgressAggregator {
@@ -90,25 +100,37 @@ export interface BatchProgressAggregator {
  * every accepted event INCLUDING possible regressions (a slow plan's engine
  * percent can dip mid-run); the transport sink's monotonic gate is the
  * guaranteed fence, exactly as for `video_render` (the plan entry's recorded
- * division of labor). `totalPlans ≥ 1` is guaranteed by renderBatch (an empty
- * expansion fails OPERATION_INVALID before an aggregator exists); the `max`
- * keeps the pure function safe for direct unit use. A single-plan batch
- * degrades to exactly `video_render`'s raw stream (fraction = percent/100,
- * so overall = percent; the engine parse already clamps to ≤ 100 — the
- * fraction clamp is the defensive mirror). No synthetic final-100 event:
- * when the last plan completes the overall IS exactly 100, forwarded through
- * the consumer's normal gates (the response frame is completion). */
+ * division of labor). `planPaths` = the EXPANDED plan list (length = N,
+ * entries = display names via basename — T26); `max` keeps the pure function
+ * safe for direct unit use with `totalPlans ≥ 1` guaranteed by renderBatch
+ * (an empty expansion fails OPERATION_INVALID before an aggregator exists;
+ * an index fed beyond the array degrades to a deterministic `plan-i` name —
+ * unreachable via renderBatch). A single-plan batch degrades to exactly
+ * `video_render`'s raw stream (fraction = percent/100, so overall = percent;
+ * the engine parse already clamps to ≤ 100 — the fraction clamp is the
+ * defensive mirror). No synthetic final-100 event: when the last plan
+ * completes the overall IS exactly 100, forwarded through the consumer's
+ * normal gates (the response frame is completion). */
 export function createBatchProgressAggregator(
-  totalPlans: number,
+  planPaths: readonly string[],
   emit: (p: BatchProgressEvent) => void,
 ): BatchProgressAggregator {
-  const n = Math.max(1, Math.floor(totalPlans));
+  const n = Math.max(1, Math.floor(planPaths.length));
+  const names = planPaths.map((p) => path.basename(p));
   const fractions = new Array<number>(n).fill(0);
   const lastTimeSec = new Array<number>(n).fill(0);
   const forward = (index: number): void => {
     let sum = 0;
     for (const f of fractions) sum += f;
-    emit({ percent: (sum / n) * 100, timeSec: lastTimeSec[index]! });
+    const overall = (sum / n) * 100;
+    const planPct = (fractions[index] ?? 0) * 100;
+    // (T26) FIXED display template — the exact spelling is contract (AGENTS):
+    // `plan i/N (basename): P% — overall O%`, both percents Math.round ints
+    emit({
+      percent: overall,
+      timeSec: lastTimeSec[index] ?? 0,
+      message: `plan ${index + 1}/${n} (${names[index] ?? `plan-${index + 1}`}): ${Math.round(planPct)}% — overall ${Math.round(overall)}%`,
+    });
   };
   return {
     planEvent: (index, p) => {
@@ -238,8 +260,10 @@ export async function renderBatch(args: string[], opts: RenderBatchOpts = {}): P
   debug(`render-batch: ${plans.length} plan(s), jobs=${jobs}`);
   // (T23) overall-batch progress — constructed only when a sink is attached,
   // so the CLI/stdio paths take the identical no-aggregator code path.
+  // (T26) the aggregator gets the EXPANDED plan paths: N = plans.length and
+  // each event's `message` names the in-flight plan by basename.
   const aggregator = opts.onProgress
-    ? createBatchProgressAggregator(plans.length, opts.onProgress)
+    ? createBatchProgressAggregator(plans, opts.onProgress)
     : undefined;
 
   // Every item is wrapped so a validation/render failure is CAPTURED per

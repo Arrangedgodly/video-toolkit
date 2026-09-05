@@ -571,6 +571,18 @@ test("sink: token is echoed verbatim in JSON — string stays quoted, integer st
   assert.ok(!intFrames[0]!.includes('"progressToken":"7"'));
 });
 
+test("sink: (T26) a provided message wins verbatim; absent keeps the historical rendering-time message", () => {
+  const frames: { params: ProgressParams }[] = [];
+  let clock = 0;
+  const sink = createProgressSink("t", (n) => frames.push(n as { params: ProgressParams }), () => clock);
+  sink({ percent: 5, timeSec: 1.234, message: "plan 2/3 (b.json): 45% — overall 62%" }); // batch shape
+  clock = 300; // clear the ≥250 ms gate for the second emit
+  sink({ percent: 6, timeSec: 2.5 }); // render/preview shape — no message field
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0]!.params.message, "plan 2/3 (b.json): 45% — overall 62%"); // verbatim passthrough
+  assert.equal(frames[1]!.params.message, "rendering 2.5s"); // the pre-T26 default, one decimal
+});
+
 test("SSE: token-carrying tools/call video_render streams progress, closes with the plain-path result", async () => {
   // plain path first: no token → plain JSON render, the comparison baseline
   const plain = await post(serveBase, rpc("tools/call", { name: "video_render", arguments: { plan: SSE_PLAN } }));
@@ -614,6 +626,9 @@ test("SSE: token-carrying tools/call video_render streams progress, closes with 
     assert.equal(n.params.progressToken, "sse-render-token"); // verbatim string
     assert.equal(n.params.total, 100);
     assert.ok(n.params.progress > prev, `progress must strictly increase: ${n.params.progress} after ${prev}`);
+    // (T26 regression lock) video_render messages stay BYTE-IDENTICAL to
+    // pre-T26 — `rendering <t>s`, one decimal, never a batch-style message
+    assert.match(n.params.message, /^rendering \d+\.\ds$/, `render message drifted: ${n.params.message}`);
     prev = n.params.progress;
   }
 
@@ -897,7 +912,19 @@ test("SSE: token-carrying tools/call video_render_batch streams monotonic OVERAL
     assert.equal(n.params.total, 100);
     assert.ok(n.params.progress >= 0 && n.params.progress <= 100, "overall stays in the 0-100 total domain");
     assert.ok(n.params.progress > prev, `overall must strictly increase: ${n.params.progress} after ${prev}`);
-    assert.ok(typeof n.params.message === "string" && n.params.message.length > 0);
+    // (T26) every overall frame's message names the in-flight plan — FIXED
+    // template `plan i/N (basename): P% — overall O%` with i↔basename LOCKED
+    // to the expanded plan order (1=batch-a.json, 2=batch-b.json, 3=batch-c.json)
+    const m = /^plan ([1-3])\/3 \((batch-[abc]\.json)\): (\d{1,3})% — overall (\d{1,3})%$/.exec(
+      n.params.message,
+    );
+    assert.ok(m, `message not in template: ${JSON.stringify(n.params.message)}`);
+    assert.equal(
+      m![2],
+      ["batch-a.json", "batch-b.json", "batch-c.json"][Number(m![1]) - 1],
+      "i and basename must name the SAME expanded-order plan",
+    );
+    assert.ok(Number(m![3]) <= 100 && Number(m![4]) <= 100, "display percents stay in 0-100");
     prev = n.params.progress;
   }
 

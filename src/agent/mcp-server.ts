@@ -70,12 +70,15 @@ export interface DispatchOptions {
    * forward renderPlan's existing onProgress hook verbatim (fed by the ffmpeg
    * progress parse); video_render_batch forwards the AGGREGATED overall
    * ((Σ per-plan fractions)/N × 100, per src/render/batch.ts — T23, R6's
-   * named future sink-firing). Only a streaming transport passes one; stdio
-   * never does, so its stdout stays byte-identical — notifications surface
-   * ONLY through this callback and the return contract below is unchanged.
+   * named future sink-firing). (T26) BATCH events additionally carry the
+   * optional formatted `message` ("plan i/N (<basename>): P% — overall O%");
+   * render/preview events omit it (the sink's own default message names the
+   * encoded time). Only a streaming transport passes one; stdio never does,
+   * so its stdout stays byte-identical — notifications surface ONLY through
+   * this callback and the return contract below is unchanged.
    * Throttling + monotonicity are transport policy (R6: the sink lives in
    * src/agent/mcp-http.ts). */
-  onProgress?: (p: { percent: number | null; timeSec: number }) => void;
+  onProgress?: (p: { percent: number | null; timeSec: number; message?: string }) => void;
 }
 
 interface ToolDef {

@@ -67,7 +67,7 @@ export function createProgressSink(
   token: string | number,
   write: (obj: unknown) => void,
   now: () => number = Date.now,
-): (p: { percent: number | null; timeSec: number }) => void {
+): (p: { percent: number | null; timeSec: number; message?: string }) => void {
   let lastEmitMs = -Infinity; // first eligible event emits immediately
   let lastSent = 0; // the 0–100 domain starts at 0
   return (p) => {
@@ -84,7 +84,9 @@ export function createProgressSink(
         progressToken: token,
         progress: p.percent,
         total: 100,
-        message: `rendering ${p.timeSec.toFixed(1)}s`,
+        // (T26) batch events carry their own formatted message naming the
+        // in-flight plan; render/preview keep the historical time message
+        message: p.message ?? `rendering ${p.timeSec.toFixed(1)}s`,
       },
     });
   };
