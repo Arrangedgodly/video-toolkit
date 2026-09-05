@@ -27,6 +27,14 @@ npm run build
 npm link        # puts `video` and `video-mcp` on PATH
 ```
 
+Or install directly from GitHub, with no checkout at all:
+
+```sh
+npm install -g github:Arrangedgodly/video-toolkit
+```
+
+A git install fetches `devDependencies` from the npm registry and runs `prepare` (`npm run build`) to compile `dist/` at install time — normal npm behavior for git dependencies. Run-time prerequisites are the same ([Node ≥ 20](#prerequisites), `ffmpeg`/`ffprobe` on `PATH`). The `github:` URL serves the pushed `master` branch, so this line goes live for other machines once `master` is pushed.
+
 Then, on any video:
 
 ```sh
