@@ -14,7 +14,7 @@ Editing video with an agent (or a shell) usually means stringing together FFmpeg
 ## Prerequisites
 
 - Node.js ≥ 20
-- `ffmpeg` and `ffprobe` on `PATH` — burned captions additionally require a build with **libass** (e.g. Homebrew's `ffmpeg-full`); `video diagnose` reports what your build supports
+- `ffmpeg` and `ffprobe` on `PATH` — burned captions additionally require a build with **libass** (e.g. Homebrew's `ffmpeg-full`); `video diagnose` reports what your build supports, and `video doctor` diagnoses every dependency at once (status `ok`/`degraded`/`broken` with per-check impact + remediation)
 - Optional transcription engines (see [engines](./AGENTS.md#engines-transcription)): Handy.app on macOS (Parakeet, the default) and/or `whisper-cli` (whisper.cpp) with a model in `.video-agent/models/` (default name `ggml-base.en.bin`) — without a resolvable engine, `transcribe` fails with the machine-readable `TRANSCRIPTION_ENGINE_UNAVAILABLE` instead of guessing
 
 ## Quickstart
@@ -62,6 +62,12 @@ video render-batch <plans...>  render many plans with bounded parallelism
                            (files, directories, or * globs; failing plans are
                            reported, the batch continues)
 video diagnose             environment + ffmpeg capabilities (JSON)
+video doctor               one-command dependency diagnosis (JSON): every check
+                           (node vs engines, ffmpeg/ffprobe, subtitles/drawtext
+                           filters, encoders incl. hardware, overlay font,
+                           transcription engines, `say`, cache writability) with
+                           impact + remediation; status ok|degraded|broken
+                           (broken = core binaries missing; exit 0 unless broken)
 video benchmark <input>    measure fastest encoder/concurrency on this machine
 video transitions          crossfade kinds on this ffmpeg build (JSON)
 ```

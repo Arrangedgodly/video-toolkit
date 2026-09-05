@@ -10,6 +10,7 @@ import { lintPlanFile } from "../validate/lint.js";
 import { renderPlan } from "../render/render.js";
 import { renderBatch } from "../render/batch.js";
 import { diagnose } from "../hardware/diagnose.js";
+import { runDoctor } from "../doctor/doctor.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
 import { catalogTransitions } from "../media/transitions.js";
 import { detectSilence } from "../analysis/silence.js";
@@ -286,6 +287,12 @@ const TOOLS: ToolDef[] = [
   },
   { name: "video_diagnose", description: "Environment + ffmpeg capabilities.", inputSchema: { type: "object", properties: {} } },
   {
+    name: "video_doctor",
+    description:
+      "One-command dependency diagnosis: node vs engines, ffmpeg/ffprobe, subtitles/drawtext filters, encoders incl. hardware, the overlay font, transcription engines (Handy, whisper-cli + model resolution across both models dirs), `say`, and cache writability (cwd + toolkit root) — each check with impact + remediation. status ok|degraded|broken (broken = core binaries missing: ffmpeg/ffprobe absent or node below engines; degraded = optional capabilities missing). The report is ALWAYS the payload — broken is not an isError (payload = CLI stdout shape).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "video_benchmark",
     description: "Measure fastest encoder/concurrency on this machine for a given input.",
     inputSchema: {
@@ -478,6 +485,10 @@ async function callTool(
       });
     case "video_diagnose":
       return diagnose();
+    case "video_doctor":
+      // the report IS the payload — a broken environment is a diagnosis,
+      // not a tool failure (exit-code semantics are the CLI's)
+      return runDoctor();
     case "video_benchmark":
       return benchmarkInput(String(a.input), { seconds: a.seconds as number | undefined });
     case "video_measure_loudness":

@@ -9,6 +9,7 @@ import { renderBatch } from "../render/batch.js";
 import { validatePlan } from "../validate/validate.js";
 import { lintPlanFile } from "../validate/lint.js";
 import { diagnose } from "../hardware/diagnose.js";
+import { runDoctor } from "../doctor/doctor.js";
 import { benchmarkInput } from "../benchmark/benchmark.js";
 import { catalogTransitions } from "../media/transitions.js";
 import { detectSilence } from "../analysis/silence.js";
@@ -43,7 +44,10 @@ commands:
                              summary + per-plan results, exit 0 iff all
                              succeeded) [--jobs N] [--force]
   diagnose                   environment + ffmpeg capabilities (JSON)
-  benchmark <input>          measure fastest encoder/concurrency on this machine
+  doctor                     one-command dependency diagnosis (JSON) — every
+                             check with impact + remediation; status
+                             ok|degraded|broken (broken = core binaries
+                             missing; exit 0 unless broken)
   transitions                crossfade kinds on this ffmpeg build (JSON;
                              feeds the crossfade plan op's kind)
 
@@ -329,6 +333,12 @@ async function main(): Promise<void> {
     }
     case "diagnose": {
       emit(f, await diagnose());
+      return;
+    }
+    case "doctor": {
+      const report = await runDoctor();
+      emit(f, report);
+      process.exitCode = report.status === "broken" ? 1 : 0;
       return;
     }
     case "render-batch": {
