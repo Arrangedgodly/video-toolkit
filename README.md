@@ -141,6 +141,10 @@ Schemas are Zod discriminated unions (`src/core/schemas.ts`); adding an operatio
 4. **Preview** — `video preview` writes `<output>.preview.mp4` (640w, ultrafast, CRF 30), so iterating can never clobber the final. Inspect the result with `extract-frame`/`review-frames` and loop back to the plan.
 5. **Render** — `video render`, once, when the plan is approved: one pass, final settings (CRF 18, `medium`, AAC 192k). `--force` is required to overwrite an existing output, and the source can never be an output. `--encoder libx264|h264_videotoolbox` overrides the codec choice; `video benchmark <input>` measures which is fastest on your machine. Many plans at once: `video render-batch <plans...>` renders plan files, directories (`*.json` inside), or `*` globs with bounded parallelism (`--jobs N`, default = the first plan's source benchmark concurrency recommendation) — an invalid or failing plan is reported in the per-plan results and the batch always runs to completion (exit 0 only if every plan succeeded).
 
+## Examples
+
+[`examples/`](./examples/) is a runnable cookbook: seven small plans covering the flagship workflows — silence tightening, filler cuts at exact word anchors, highlight compilation, a watermark + burned-captions tutorial cut, a crossfade + zoom montage, a GIF loop export, and a music bed with sidechain ducking. Every referenced input regenerates from a copy-paste ffmpeg `lavfi` one-liner in [`examples/README.md`](./examples/README.md) — speech via `say` on macOS with a lavfi fallback everywhere else — so each example validates, lints, previews, and renders from an empty directory on any OS. The whole cookbook is smoke-tested on every `npm test` (`src/test/examples.test.ts`).
+
 ## Errors
 
 Every failure boundary reports a stable, machine-readable code — branch, fix, retry:

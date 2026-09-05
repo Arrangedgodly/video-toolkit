@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "source": "input.mp4",
+  "operations": [
+    { "type": "trim", "start": 2, "end": 12 },
+    { "type": "image-overlay", "file": "logo.png", "position": "bottom-right", "width": 96, "opacity": 0.8 },
+    { "type": "captions", "file": "captions.srt" }
+  ],
+  "output": { "path": "watermark-captions.mp4", "mode": "final" }
+}

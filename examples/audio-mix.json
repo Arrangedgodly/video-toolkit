@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "source": "speech.mp4",
+  "operations": [
+    { "type": "trim", "start": 0, "end": 10 },
+    { "type": "audio-mix", "file": "bed.mp3", "level": -18 }
+  ],
+  "output": { "path": "audio-mix.mp4", "mode": "final" }
+}

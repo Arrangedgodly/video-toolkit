@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "source": "input.mp4",
+  "operations": [
+    { "type": "trim", "start": 0, "end": 4 },
+    { "type": "trim", "start": 8, "end": 12 },
+    { "type": "trim", "start": 16, "end": 20 },
+    { "type": "crossfade", "duration": 0.5, "kind": "fade" },
+    { "type": "zoom", "mode": "in", "factor": 1.2 }
+  ],
+  "output": { "path": "montage.mp4", "mode": "final" }
+}

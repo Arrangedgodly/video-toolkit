@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "source": "speech.mp4",
+  "operations": [
+    { "type": "trim", "start": 0, "end": 22 },
+    { "type": "cut", "start": 0.9, "end": 1.35 },
+    { "type": "cut", "start": 5.98, "end": 6.85 }
+  ],
+  "output": { "path": "filler-cut.mp4", "mode": "final" }
+}

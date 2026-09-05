@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "source": "input.mp4",
+  "operations": [
+    { "type": "trim", "start": 5, "end": 14 },
+    { "type": "speed", "factor": 1.5 },
+    { "type": "export-gif", "width": 480, "fps": 12, "from": 1, "to": 4 }
+  ],
+  "output": { "path": "loop.gif", "mode": "final" }
+}

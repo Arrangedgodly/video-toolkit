@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "source": "speech.mp4",
+  "operations": [
+    { "type": "trim", "start": 0, "end": 4.5 },
+    { "type": "trim", "start": 8, "end": 12 },
+    { "type": "trim", "start": 16, "end": 20 }
+  ],
+  "output": { "path": "highlights.mp4", "mode": "final" }
+}
