@@ -501,6 +501,11 @@ test("overlay-text validation: from<to, output-duration bounds (speed-aware), du
 // spike: keep [1,4]+[5.5,9]+[11,14.5] = 10.0s timeline, D=0.5 -> offsets
 // 2.5/5.5, expected output 10.0 − 2·0.5 = 9.0s)
 
+// BLOCKS' frame rate (the r=30 lavfi color sources that build it above) —
+// frame-derived duration tolerances in this section are computed from it,
+// never hard-coded as seconds.
+const XF_FPS = 30;
+
 const XF_TRIMS = [
   { type: "trim", start: 1, end: 4 },
   { type: "trim", start: 5.5, end: 9 },
@@ -589,7 +594,13 @@ test("crossfade: speed composes AFTER the chain (duration = (timeline − shrink
   const cmd = r.command.join(" ");
   assert.ok(cmd.includes("setpts=PTS/1.25"), cmd); // NOT N/FRAME_RATE/TB
   assert.ok(cmd.includes("atempo=1.25"), cmd);
-  assert.ok(Math.abs(r.outputDuration - 7.2) < 0.05, `duration ${r.outputDuration}`);
+  // Tolerance ±2 frames (was ±1): fractional setpts AFTER the xfade chain
+  // quantizes differently across ffmpeg builds — CI's ubuntu apt ffmpeg
+  // (run 33944749568) rendered 7.266667 vs dev 9.0.1's 7.2, an exact
+  // 2-frame delta at 30 fps and not drift (single invocation, setpts/atempo
+  // placement, and the 9.0s pre-speed law all still asserted above/elsewhere).
+  // The +1e-6 is ffprobe's µs reporting round-off, not extra frame slack.
+  assert.ok(Math.abs(r.outputDuration - 7.2) < 2 / XF_FPS + 1e-6, `duration ${r.outputDuration}`);
 });
 
 test("crossfade: burned captions align to the REMAPPED anchors (outcome (a), not the drifting plain ones)", async () => {
