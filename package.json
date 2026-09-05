@@ -1,8 +1,27 @@
 {
   "name": "video-toolkit",
-  "version": "0.1.0",
-  "description": "Agent-native video editing toolkit: deterministic tools, versioned edit plans, single-pass rendering.",
+  "version": "0.13.0",
+  "description": "Agent-native video editing toolkit: deterministic tools, versioned edit plans, single-pass ffmpeg rendering, word-level transcription, transitions, and MCP servers (stdio + streamable HTTP).",
   "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "ffmpeg",
+    "mcp",
+    "ai-agents",
+    "transcription",
+    "whisper",
+    "parakeet",
+    "editing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arrangedgodly/video-toolkit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Arrangedgodly/video-toolkit/issues"
+  },
+  "homepage": "https://github.com/Arrangedgodly/video-toolkit#readme",
   "bin": {
     "video": "dist/cli/index.js",
     "video-mcp": "dist/agent/mcp-server.js"
