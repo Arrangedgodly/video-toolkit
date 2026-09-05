@@ -42,12 +42,34 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 // ---- R6 progress-over-SSE (docs/ultron/research/r6-mcp-progress-sse.md) ----
+// T30: this block (conformance predicate + sink factory + throttle constants)
+// is the ONE home of progress policy — the stdio transport imports the same
+// exports (isLoopbackHost precedent), so framing differs but the gate never
+// drifts between transports.
 
 /** Throttle item 5 (committed): emit only when ≥250 ms AND ≥1.0 progress-point
  * have passed — bounds both rate (≤4/s) and total count (≤100 events per
  * render: each must advance ≥1 point of a 0–100 domain, regardless of length). */
 export const PROGRESS_MIN_INTERVAL_MS = 250;
 export const PROGRESS_MIN_DELTA = 1.0;
+
+/** R6 checklist item 1: a `tools/call` opts into progress IFF its
+ * `params._meta.progressToken` is a string or an integer — float/object/
+ * null/absent are treated as absent (⇒ the plain path). Exported because the
+ * stdio transport applies the IDENTICAL rule to the same message shape (T30);
+ * single source of truth, no per-transport drift. */
+export function conformingProgressToken(message: McpMessage): string | number | undefined {
+  if (message.method !== "tools/call") return undefined;
+  const meta = message.params?._meta;
+  const rawToken =
+    typeof meta === "object" && meta !== null && !Array.isArray(meta)
+      ? (meta as Record<string, unknown>).progressToken
+      : undefined;
+  if (typeof rawToken === "string" || (typeof rawToken === "number" && Number.isInteger(rawToken))) {
+    return rawToken;
+  }
+  return undefined;
+}
 
 /**
  * Throttled, strictly-increasing progress sink for one streamed request (R6
@@ -278,21 +300,18 @@ export function startHttpServer(opts: HttpServeOptions = {}): Server {
       return;
     }
     // 9b. R6: a `tools/call` carrying a CONFORMING `_meta.progressToken`
-    //     (string or integer — float/object/null/absent are treated as absent
-    //     ⇒ plain path) opts into the SSE reply. Placement: AFTER every R4
-    //     gate above (security is complete before any stream opens — a
-    //     streamed call has passed every gate a plain call would), BEFORE
-    //     handleMessage is awaited. No tool-name allowlist (the committed
-    //     rule): every token-carrying call streams; tools without progress
-    //     wiring (inspect, validate, …) simply emit a response-only stream.
+    //     (conformingProgressToken — string or integer; float/object/null/
+    //     absent are treated as absent ⇒ plain path) opts into the SSE reply.
+    //     Placement: AFTER every R4 gate above (security is complete before
+    //     any stream opens — a streamed call has passed every gate a plain
+    //     call would), BEFORE handleMessage is awaited. No tool-name allowlist
+    //     (the committed rule): every token-carrying call streams; tools
+    //     without progress wiring (inspect, validate, …) simply emit a
+    //     response-only stream.
     if (message.method === "tools/call") {
-      const meta = message.params?._meta;
-      const rawToken =
-        typeof meta === "object" && meta !== null && !Array.isArray(meta)
-          ? (meta as Record<string, unknown>).progressToken
-          : undefined;
-      if (typeof rawToken === "string" || (typeof rawToken === "number" && Number.isInteger(rawToken))) {
-        await replySseCall(message, res, rawToken);
+      const progressToken = conformingProgressToken(message);
+      if (progressToken !== undefined) {
+        await replySseCall(message, res, progressToken);
         return;
       }
     }

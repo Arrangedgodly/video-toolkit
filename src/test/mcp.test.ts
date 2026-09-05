@@ -1,14 +1,22 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { runCapture } from "../media/ffprobe.js";
 import { CROSSFADE_KINDS } from "../core/schemas.js";
+import { stdioProgressSink, type McpMessage } from "../agent/mcp-server.js";
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
 const SERVER = path.resolve(import.meta.dirname, "..", "agent", "mcp-server.js");
+const CLI = path.resolve(import.meta.dirname, "..", "cli", "index.js");
+/** T30 stdio-progress fixtures: 20 s 720p final render — the T20 SSE sizing
+ * (renders ≥ ~2 s wall, ffmpeg stats every ~0.5 s), long enough for several
+ * engine events to clear the shared sink's 250 ms / 1.0-point dual gate, so
+ * ≥2 notification LINES are guaranteed, not racy. */
+const PROGRESS_FIXTURE = "progress-src.mp4";
+const PROGRESS_PLAN = "progress-plan.json"; // final render → progress-out.mp4
 let dir = "";
 let child: ReturnType<typeof spawn> | null = null;
 const responses = new Map<number, unknown>();
@@ -49,6 +57,24 @@ before(async () => {
     "-c:a", "aac", FIXTURE,
   ]);
   assert.equal(r.code, 0, r.stderr);
+
+  const pr = await runCapture("ffmpeg", [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
+    "-f", "lavfi", "-i", "sine=frequency=440",
+    "-t", "20", "-c:v", "libx264", "-crf", "28", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", PROGRESS_FIXTURE,
+  ]);
+  assert.equal(pr.code, 0, pr.stderr);
+  await writeFile(
+    PROGRESS_PLAN,
+    JSON.stringify({
+      version: 1,
+      source: PROGRESS_FIXTURE,
+      operations: [{ type: "trim", start: 0, end: 20 }],
+      output: { path: "progress-out.mp4", mode: "final" },
+    }),
+  );
 
   child = spawn(process.execPath, [SERVER], { stdio: ["pipe", "pipe", "ignore"] });
   const buf: string[] = [];
@@ -250,4 +276,209 @@ test("bin-style invocation (argv[1] not ending in mcp-server.js) starts the serv
     proc.kill();
     await rm(binLink, { force: true });
   }
+});
+
+// ---- T30: stdio progress notifications (R6's contract over JSON lines) ----
+
+/** Spawn `video mcp` (the full CLI path), write the request lines, resolve ALL
+ * stdout lines once the RESPONSE carrying `responseId` arrives — plus a short
+ * grace window so an unexpected straggler (e.g. a notification after the
+ * response) is captured and fails the exact-line assertions. Always WAITS for
+ * the response instead of racing a fixed quiet timer (robust under full-suite
+ * CPU contention, the stdioExchange precedent). */
+function cliMcpExchange(lines: string[], responseId: number, graceMs = 350, timeoutMs = 30000): Promise<string[]> {
+  const proc = spawn(process.execPath, [CLI, "mcp"], { stdio: ["pipe", "pipe", "ignore"] });
+  const out: string[] = [];
+  let pending = "";
+  return new Promise((resolve) => {
+    let settled = false;
+    let grace: NodeJS.Timeout | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (grace !== undefined) clearTimeout(grace);
+      clearTimeout(overall);
+      proc.kill();
+      resolve(out);
+    };
+    const overall = setTimeout(finish, timeoutMs);
+    proc.stdout!.setEncoding("utf8");
+    proc.stdout!.on("data", (d: string) => {
+      if (settled) return;
+      pending += d;
+      let nl: number;
+      while ((nl = pending.indexOf("\n")) >= 0) {
+        out.push(pending.slice(0, nl));
+        pending = pending.slice(nl + 1);
+      }
+      if (out.some((l) => {
+        try {
+          return (JSON.parse(l) as { id?: unknown }).id === responseId;
+        } catch {
+          return false;
+        }
+      })) {
+        if (grace !== undefined) clearTimeout(grace);
+        grace = setTimeout(finish, graceMs);
+      }
+    });
+    proc.stdin!.on("error", () => {
+      // EPIPE after kill — expected
+    });
+    for (const line of lines) proc.stdin!.write(line + "\n");
+  });
+}
+
+interface ProgressLine {
+  jsonrpc: string;
+  method: string;
+  params: { progressToken: unknown; progress: number; total: number; message: string };
+}
+
+test("T30 unit: stdioProgressSink emits notifications/progress frames via the injected writer (fake clock)", () => {
+  const frames: ProgressLine[] = [];
+  let clock = 0;
+  const msg: McpMessage & { jsonrpc?: string } = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "video_render", arguments: {}, _meta: { progressToken: "stdio-tok" } },
+  };
+  const sink = stdioProgressSink(msg, (n) => frames.push(n as ProgressLine), () => clock);
+  assert.ok(sink, "a conforming token must produce a sink");
+
+  sink({ percent: null, timeSec: 0.5 }); // null percent → never a line
+  clock = 100;
+  sink({ percent: 2.5, timeSec: 0.5 }); // first eligible event → line
+  clock = 200;
+  sink({ percent: 80, timeSec: 16 }); // <250 ms since the emit → suppressed
+  clock = 400; // ≥250 ms since the emit — time gate open again
+  sink({ percent: 3.55, timeSec: 0.8 }); // Δ1.05 ≥ 1.0 → line (regression below 80 is the sink's fence)
+
+  // the SAME shared createProgressSink dual gate (≥250 ms AND ≥1.0 point),
+  // strict monotonicity of EMITTED progress — no duplicated throttle logic
+  assert.deepEqual(
+    frames.map((f) => f.params.progress),
+    [2.5, 3.55],
+  );
+  for (const f of frames) {
+    assert.equal(f.jsonrpc, "2.0");
+    assert.equal(f.method, "notifications/progress");
+    assert.equal(f.params.progressToken, "stdio-tok"); // verbatim string
+    assert.equal(f.params.total, 100);
+    assert.equal(typeof f.params.message, "string");
+  }
+  // each frame is ONE JSON object — the live writer appends the "\n"
+  assert.ok(JSON.stringify(frames[0]).includes('"method":"notifications/progress"'));
+
+  // integer token stays an integer in the frame (never stringified)
+  const intFrames: string[] = [];
+  const intSink = stdioProgressSink(
+    { method: "tools/call", params: { _meta: { progressToken: 42 } } },
+    (n) => intFrames.push(JSON.stringify(n)),
+    () => 0,
+  );
+  assert.ok(intSink);
+  intSink({ percent: 5, timeSec: 1 });
+  assert.ok(intFrames[0]!.includes('"progressToken":42'));
+  assert.ok(!intFrames[0]!.includes('"progressToken":"42"'));
+});
+
+test("T30 unit: no sink — and never a write — for no-token / non-conforming / non-tools/call shapes", () => {
+  const write = (): void => {
+    throw new Error("writer must not be called");
+  };
+  type WireMessage = McpMessage & { jsonrpc?: string };
+  const degraded: WireMessage[] = [
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "video_render", arguments: {} } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "video_render", arguments: {}, _meta: {} } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "video_render", arguments: {}, _meta: { progressToken: 1.5 } } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "video_render", arguments: {}, _meta: { progressToken: { x: 1 } } } },
+    { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "video_render", arguments: {}, _meta: { progressToken: null } } },
+    // R6 degradation rule: a token on a non-tools/call method never opts in
+    { jsonrpc: "2.0", id: 6, method: "tools/list", params: { _meta: { progressToken: "nope" } } },
+  ];
+  for (const msg of degraded) {
+    assert.equal(stdioProgressSink(msg, write), undefined, JSON.stringify(msg));
+  }
+  // conforming shapes DO get a sink (string + integer), tools/call only
+  assert.ok(stdioProgressSink({ method: "tools/call", params: { _meta: { progressToken: "s" } } }, write));
+  assert.ok(stdioProgressSink({ method: "tools/call", params: { _meta: { progressToken: 7 } } }, write));
+});
+
+test("T30 integration: token-carrying tools/call video_render over `video mcp` — notification LINES then exactly one response line", async () => {
+  const id = 101;
+  const lines = await cliMcpExchange(
+    [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: {
+          name: "video_render",
+          arguments: { plan: PROGRESS_PLAN },
+          _meta: { progressToken: "stdio-render" },
+        },
+      }),
+    ],
+    id,
+  );
+  assert.ok(lines.length >= 3, `expected >=2 notifications + 1 response, got ${lines.length}: ${lines.join(" | ")}`);
+
+  // every line BEFORE the last is a notification; the LAST line is the response
+  const notes = lines.slice(0, -1).map((l) => JSON.parse(l) as ProgressLine);
+  assert.ok(notes.length >= 2, `expected >=2 progress lines, got ${notes.length}`);
+  let prev = -Infinity;
+  for (const n of notes) {
+    assert.equal(n.method, "notifications/progress");
+    assert.equal(n.params.progressToken, "stdio-render"); // verbatim echo
+    assert.equal(n.params.total, 100);
+    assert.ok(n.params.progress > prev, `progress must strictly increase: ${n.params.progress} after ${prev}`);
+    // video_render keeps the historical time message (T26 lock, stdio side)
+    assert.match(n.params.message, /^rendering \d+\.\ds$/, `render message drifted: ${n.params.message}`);
+    prev = n.params.progress;
+  }
+
+  const response = JSON.parse(lines[lines.length - 1]!) as {
+    id: number;
+    result: { isError?: boolean; content: { text: string }[] };
+  };
+  assert.equal(response.id, id); // exactly one response line, matching id, last
+  assert.notEqual(response.result.isError, true);
+  const payload = JSON.parse(response.result.content[0]!.text) as { mode: string; output: string };
+  assert.equal(payload.mode, "final");
+  assert.ok(payload.output.endsWith("progress-out.mp4")); // resolved absolute path
+});
+
+test("T30 integration: no-token tools/call video_render → exactly one response line, zero notifications (degradation lock)", async () => {
+  const id = 102;
+  const lines = await cliMcpExchange(
+    [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "video_render", arguments: { plan: PROGRESS_PLAN, force: true } },
+      }),
+    ],
+    id,
+  );
+  assert.equal(lines.length, 1); // single response line — progress events fire, none surface
+  assert.ok(!lines[0]!.includes("notifications/progress"));
+  const response = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
+  assert.equal(response.id, id);
+  const payload = JSON.parse(response.result.content[0]!.text) as { mode: string };
+  assert.equal(payload.mode, "final");
+});
+
+test("T30 integration: tools/list WITH a token → response-only, no notifications (R6 degradation rule)", async () => {
+  const id = 103;
+  const lines = await cliMcpExchange(
+    [JSON.stringify({ jsonrpc: "2.0", id, method: "tools/list", params: { _meta: { progressToken: "nope" } } })],
+    id,
+  );
+  assert.equal(lines.length, 1); // a token never opts a non-tools/call method in
+  const response = JSON.parse(lines[0]!) as { id: number; result: { tools: unknown[] } };
+  assert.equal(response.id, id);
+  assert.equal(response.result.tools.length, 21);
 });

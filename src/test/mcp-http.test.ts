@@ -17,6 +17,10 @@ import { createProgressSink, isLoopbackHost } from "../agent/mcp-http.js";
 // video_render_batch on a real multi-plan batch streams the AGGREGATED
 // overall ((Σ per-plan fractions)/N × 100) and closes with the unchanged
 // BatchReport; no-token/stdio stay on their byte-identical paths.
+// T30 — stdio speaks the token contract too (notification LINES then one
+// response line, tested in mcp.test.ts); the stdio locks HERE cover the
+// degraded shapes that must stay exactly one response line forever
+// (non-progress tool with a token; batch WITHOUT a token).
 
 const FIXTURE = "fixture.mp4"; // 8s, audio + video
 /** T20 SSE fixtures: 20 s 720p — a final render runs ≥ ~2 s wall here, long
@@ -824,7 +828,10 @@ test("stream-then-plain on the pooled connection: chunked framing is self-delimi
   assert.equal(tools.length, TOOLS.length);
 });
 
-test("stdio: a token-carrying tools/call emits exactly one response line — never a notification", async () => {
+test("stdio: a token-carrying tools/call on a NON-progress tool stays exactly one response line (R6 degradation rule, T30)", async () => {
+  // T30 gave stdio the same token contract as SSE — but inspect has no
+  // progress wiring, so nothing ever fires the sink: response-only, exactly
+  // like the HTTP path's response-only stream for the same call.
   const lines = await stdioExchange(
     [
       JSON.stringify({
@@ -840,7 +847,7 @@ test("stdio: a token-carrying tools/call emits exactly one response line — nev
     ],
     1,
   );
-  assert.equal(lines.length, 1); // stdout stays byte-identical protocol output
+  assert.equal(lines.length, 1); // one response line, never a notification
   assert.ok(!lines[0]!.includes("notifications/progress"));
   const parsed = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
   assert.equal(parsed.id, 21);
@@ -938,7 +945,11 @@ test("SSE: token-carrying tools/call video_render_batch streams monotonic OVERAL
   assert.equal(report.summary.jobs, 3);
 });
 
-test("stdio: token-carrying tools/call video_render_batch emits exactly one response line — never a notification", async () => {
+test("stdio: NO-token tools/call video_render_batch emits exactly one response line — never a notification (T30 degradation lock)", async () => {
+  // T30: with a token this call now STREAMS notification lines on stdio (the
+  // mcp.test.ts T30 integration covers that path); the lock's eternal half is
+  // the no-token degradation — no sink is ever attached, so progress events
+  // fire into nothing and stdout carries exactly the one response line.
   const lines = await stdioExchange(
     [
       JSON.stringify({
@@ -948,13 +959,13 @@ test("stdio: token-carrying tools/call video_render_batch emits exactly one resp
         params: {
           name: "video_render_batch",
           arguments: { plans: ["batch-a.json"], jobs: 1, force: true },
-          _meta: { progressToken: "stdio-batch" },
+          // no _meta.progressToken — the byte-identical plain path
         },
       }),
     ],
     1,
   );
-  assert.equal(lines.length, 1); // stdio passes no sink — no aggregation, no notifications
+  assert.equal(lines.length, 1); // no sink attached — no aggregation, no notifications
   assert.ok(!lines[0]!.includes("notifications/progress"));
   const parsed = JSON.parse(lines[0]!) as { id: number; result: { content: { text: string }[] } };
   assert.equal(parsed.id, 22);

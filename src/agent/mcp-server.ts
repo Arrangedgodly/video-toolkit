@@ -26,6 +26,12 @@ import { generateCaptions } from "../captions/generate.js";
 import { SceneReport, SilenceReport, TranscriptReport } from "../core/schemas.js";
 import { readFile } from "node:fs/promises";
 import { ToolError } from "../core/errors.js";
+// R6 progress policy lives in the HTTP adapter (the committed home of the
+// sink); the stdio transport imports the SAME factory + conformance predicate
+// instead of duplicating the throttle (isLoopbackHost precedent). The resulting
+// module cycle is safe: every cross-reference is a hoisted function declaration
+// used only at call time, never during module evaluation.
+import { conformingProgressToken, createProgressSink } from "./mcp-http.js";
 
 /**
  * MCP server core + stdio adapter (JSON-RPC, newline-delimited). Thin: every
@@ -34,7 +40,10 @@ import { ToolError } from "../core/errors.js";
  * the stdio transport (`startStdioServer`) and the streamable-HTTP transport
  * (`src/agent/mcp-http.ts`); protocol semantics are identical on every
  * transport. Enables MCP clients (ZCode, Claude, etc.) without touching the
- * engine.
+ * engine. (T30) stdio speaks R6's progress contract too: a `tools/call`
+ * carrying a conforming `_meta.progressToken` receives
+ * `notifications/progress` as stdout JSON LINES while the tool runs, then the
+ * single final response line; every other request shape stays byte-identical.
  */
 
 /** Protocol revisions this server speaks (initialize-era; see
@@ -74,11 +83,11 @@ export interface DispatchOptions {
    * named future sink-firing). (T26) BATCH events additionally carry the
    * optional formatted `message` ("plan i/N (<basename>): P% — overall O%");
    * render/preview events omit it (the sink's own default message names the
-   * encoded time). Only a streaming transport passes one; stdio never does,
-   * so its stdout stays byte-identical — notifications surface ONLY through
-   * this callback and the return contract below is unchanged.
+   * encoded time). Both transports pass one for a token-carrying `tools/call`
+   * — HTTP into SSE frames, stdio into stdout JSON LINES (T30); absent (CLI,
+   * no-token requests) = no notifications, byte-identical output.
    * Throttling + monotonicity are transport policy (R6: the sink lives in
-   * src/agent/mcp-http.ts). */
+   * src/agent/mcp-http.ts — shared by both transports since T30). */
   onProgress?: (p: { percent: number | null; timeSec: number; message?: string }) => void;
 }
 
@@ -373,7 +382,7 @@ async function callTool(
     }
     case "video_preview":
       // progress sink threaded through (R6): raw events only — the transport
-      // owns throttle/monotonicity policy; absent (stdio) = no notifications
+      // owns throttle/monotonicity policy; absent (CLI / no-token) = silent
       return renderPlan(String(a.plan), { mode: "preview", force: a.force === true, onProgress });
     case "video_render":
       return renderPlan(String(a.plan), {
@@ -389,7 +398,7 @@ async function callTool(
           force: a.force === true,
           // (T23) overall-batch progress (R6's named future sink-firing):
           // raw aggregate events — the transport sink owns throttle/
-          // monotonicity; absent (stdio) = no notifications, byte-identical
+          // monotonicity; absent (CLI / no-token) = silent, byte-identical
           onProgress,
         },
       );
@@ -559,6 +568,30 @@ export async function handleMessage(
   }
 }
 
+/**
+ * (T30) Build the stdio progress sink for ONE incoming message: the SAME
+ * `createProgressSink` the HTTP transport uses (R6's committed dual gate
+ * ≥ 250 ms AND ≥ 1.0 point, strict monotonicity, token echoed verbatim,
+ * `total: 100`), wrapped so `notifications/progress` objects go to `write` —
+ * for the live server that is one JSON object per `\n` on stdout, stdio's
+ * native framing where HTTP writes SSE frames. Same contract, different wire.
+ * Returns undefined for every message shape that must stay byte-identical (no
+ * token, non-conforming token, or a non-`tools/call` method — R6's
+ * degradation rule, e.g. tools/list WITH a token is response-only), so the
+ * caller simply omits the option. `write` and `now` are injectable: units
+ * capture frames through an in-memory writer on a fake clock — no real
+ * timing dependence. Stateless per request; dead once the response is written.
+ */
+export function stdioProgressSink(
+  msg: McpMessage,
+  write: (obj: unknown) => void,
+  now: () => number = Date.now,
+): DispatchOptions["onProgress"] | undefined {
+  const token = conformingProgressToken(msg);
+  if (token === undefined) return undefined;
+  return createProgressSink(token, write, now);
+}
+
 export function startStdioServer(): void {
   const write = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + "\n");
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -571,7 +604,13 @@ export function startStdioServer(): void {
     } catch {
       return;
     }
-    void handleMessage(msg).then((res) => {
+    // (T30) a token-carrying tools/call streams notifications/progress as
+    // stdout LINES while the tool runs; the response line still comes LAST
+    // (the sink writes during handleMessage, the response after it resolves;
+    // single-threaded synchronous writes keep the order). Every other shape
+    // passes no sink — output byte-identical to the pre-T30 server.
+    const onProgress = stdioProgressSink(msg, write);
+    void handleMessage(msg, onProgress !== undefined ? { onProgress } : {}).then((res) => {
       if (res !== null) write(res);
     });
   });
