@@ -1,5 +1,7 @@
 # video-toolkit
 
+[![CI](https://github.com/Arrangedgodly/video-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/Arrangedgodly/video-toolkit/actions/workflows/ci.yml)
+
 Agent-native video editing toolkit: deterministic tools, a versioned **edit plan** as the single artifact between judgment and execution, and **one-pass FFmpeg rendering** — so humans and AI agents never hand-write FFmpeg commands, parse raw ffprobe output, or reason about codecs.
 
 > [!NOTE]

@@ -8,6 +8,17 @@ import { validatePlan } from "../validate/validate.js";
 import { renderPlan } from "../render/render.js";
 import { generateCaptions } from "../captions/generate.js";
 import { CROSSFADE_KINDS } from "../core/schemas.js";
+import { OVERLAY_FONT_FILE } from "../media/ffmpeg.js";
+import { overlayFontAvailable } from "./font-availability.js";
+
+// T25 font skip-guard — the transcribe-integration engine-guard precedent
+// applied to overlay-text's FIXED font (a macOS system path; validate stats
+// it and answers OPERATION_INVALID — correct-by-error — where it is absent).
+// The four tests below validate/render overlay-text plans and would FAIL
+// (not skip) on font-less machines (linux CI): they skip here instead; every
+// other test in this file is font-independent and runs everywhere.
+const fontAvailable = await overlayFontAvailable();
+const fontSkip = !fontAvailable && `${OVERLAY_FONT_FILE} not present on this machine`;
 
 const FIXTURE = "fixture.mp4"; // 12s, 1280x720, 440Hz tone
 const SPEECH = "speech-gated.mp4"; // 12s, 3kHz bursts: 2.5s on / 1.5s off
@@ -383,7 +394,7 @@ async function maxLuma(file: string, t: number): Promise<number> {
   return m;
 }
 
-test("overlay-text burns in the same pass; visible only in its window; duration unchanged", async () => {
+test("overlay-text burns in the same pass; visible only in its window; duration unchanged", { skip: fontSkip }, async () => {
   // hostile text (apostrophe, colon, percent, comma) rides the real render —
   // the escaping unit tests pin the exact emitted filter string
   const p = await writePlan("o1.json", {
@@ -437,7 +448,7 @@ test("overlay-text burns in the same pass; visible only in its window; duration 
   assert.ok(Math.abs(pv.outputDuration - 2) < 0.3);
 });
 
-test("overlay-text validation: from<to, output-duration bounds (speed-aware), duplicates", async () => {
+test("overlay-text validation: from<to, output-duration bounds (speed-aware), duplicates", { skip: fontSkip }, async () => {
   // from >= to
   const r1 = await validatePlan(await writePlan("ov1.json", plan([
     { type: "trim", start: 0, end: 12 },
@@ -718,7 +729,7 @@ test("crossfade validation: floor, fade<every-segment (offender named), single s
   assert.ok(Math.abs(r6.outputDuration - 1.8) < 0.05, `duration ${r6.outputDuration}`);
 });
 
-test("crossfade validation: overlay-text bound consumes the crossfade-adjusted expectation", async () => {
+test("crossfade validation: overlay-text bound consumes the crossfade-adjusted expectation", { skip: fontSkip }, async () => {
   // expected output 9.0 (not the raw 10.0 timeline): to=9.5 rejected, 8.9 ok
   const bad = await validatePlan(await writePlan("xfo1.json", xfPlan([
     ...XF_TRIMS,
@@ -1199,7 +1210,7 @@ test("zoom: crossfade chain zoompans EVERY input with its own ramp; R3's duratio
   assert.ok(late.width > early.width + 4, `per-segment zoom-in: ${early.width} -> ${late.width}`);
 });
 
-test("zoom composes with speed + captions + overlay-text in the SAME single pass (R5's G1 matrix)", async () => {
+test("zoom composes with speed + captions + overlay-text in the SAME single pass (R5's G1 matrix)", { skip: fontSkip }, async () => {
   await writeFile("z4.srt", "1\n00:00:00,000 --> 00:00:02,000\nHELLO ZOOM\n");
   const p = await writePlan("z4.json", barPlan([
     ...ZOOM_TRIMS,

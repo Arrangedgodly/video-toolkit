@@ -1,0 +1,30 @@
+# T25 — minimal hosted CI: the same gate every task already runs locally
+# (`npm run typecheck` + `npm test`). Single job, no matrix, no deploy, no
+# publish, no secrets. Engine-dependent tests skip-guard themselves (say,
+# handy, whisper — see src/test/transcribe-integration.test.ts); the four
+# overlay-text integration tests skip via the font-availability guard
+# (src/test/font-availability.ts — the font is a fixed macOS system path) —
+# this workflow is the standing proof those guards hold: absent engines/font
+# make tests SKIP, never fail. whisper-cpp is intentionally NOT installed.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
